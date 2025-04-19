@@ -18,7 +18,7 @@ serde = { version = "1", features = ["derive"] }
 libc = "0.2"
 mach2 = { git = "https://github.com/JohnTitor/mach2" }
 mach_o = "0.1.2"
-disarm64 = "0.1"
+disarm64 = "0.1.24"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 retour = { version = "0.3", default-features = false }
