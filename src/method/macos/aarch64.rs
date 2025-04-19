@@ -8,7 +8,7 @@ pub(crate) fn get_immediate(op: Operation) -> Result<isize> {
     match op {
         Operation::LDST_POS(LDST_POS::LDR_Rt_ADDR_UIMM12(bitfield)) => {
             let imm12 = bitfield.imm12();
-            const x: usize = 64 - 52;
+            const x: isize = 64 - 52;
             Ok((imm12 as isize & x) << 3)
         }
         Operation::BRANCH_IMM(BRANCH_IMM::BL_ADDR_PCREL26(bitfield)) => {
