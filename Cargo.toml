@@ -13,12 +13,13 @@ patternscan = "1.2.0"
 object = "0.33"
 serde = { version = "1", features = ["derive"] }
 
-
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 mach2 = { git = "https://github.com/JohnTitor/mach2" }
 mach_o = "0.1.2"
-disarm64 = "0.1.24"
+# Needed for disarm64 decoder
+bitfield-struct = "0.10"
+disarm64_defn = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 retour = { version = "0.3", default-features = false }
@@ -32,3 +33,7 @@ features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_SystemInformation",
 ]
+
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+anyhow = "1"
