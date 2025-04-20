@@ -88,16 +88,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "disarm64"
-version = "0.1.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ccd32ba4e20b8b4a0db9c11d3a34a38ef03d729aa1d9ea4c9cd5dc6b29b5946"
-dependencies = [
- "bitfield-struct",
- "disarm64_defn",
-]
-
-[[package]]
 name = "disarm64_defn"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -330,9 +320,9 @@ dependencies = [
 
 [[package]]
 name = "rustversion"
-version = "1.0.18"
+version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e819f2bc632f285be6d7cd36e25940d45b2391dd6d9b939e79de557f7014248"
+checksum = "eded382c5f5f786b989652c49544c4877d9f015cc22e145a5ea8ea66c2921cd2"
 
 [[package]]
 name = "ruzstd"
@@ -350,7 +340,8 @@ name = "scan"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "disarm64",
+ "bitfield-struct",
+ "disarm64_defn",
  "libc",
  "libloading",
  "mach2 0.4.2 (git+https://github.com/JohnTitor/mach2)",
