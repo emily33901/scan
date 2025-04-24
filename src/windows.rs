@@ -20,7 +20,7 @@ use anyhow::Result;
 impl Module {
     pub fn code_section_address_range(&self) -> Range<usize> {
         let (start, size) = self.code_range();
-        start..start + size;
+        start..start + size
     }
 
     fn code_range(&self) -> (usize, usize) {
