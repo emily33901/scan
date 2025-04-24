@@ -7,10 +7,15 @@ pub mod windows;
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
-use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
+
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+pub type CustomActionFn<'a> = Box<dyn Fn(usize) -> Result<usize> + 'a>;
+pub type CustomActions<'a> = HashMap<String, CustomActionFn<'a>>;
+
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "action")]
 pub enum Action {
     Add { offset: isize },
@@ -20,9 +25,14 @@ pub enum Action {
     ImmediateFromInstructionAtAddress {},
     ResolveImmediateRelativeAddress {},
     ResolvePageOffsetRelativeAddress {},
+    Custom { name: String },
 }
 
-pub fn execute_plan(mut address: usize, actions: &Vec<Action>) -> Result<usize> {
+pub fn execute_plan(
+    mut address: usize,
+    actions: &Vec<Action>,
+    custom_actions: Option<&CustomActions>,
+) -> Result<usize> {
     for action in actions {
         match action {
             &Action::Add { offset } => {
@@ -57,23 +67,24 @@ pub fn execute_plan(mut address: usize, actions: &Vec<Action>) -> Result<usize> 
             #[cfg(target_arch = "aarch64")]
             &Action::ResolvePageOffsetRelativeAddress {} => {
                 address = macos::aarch64::resolve_page_and_offset_load_at_address(address)?;
-                // let page = resolve_page_aligned_relative_address(
-                //     address,
-                //     immediate_from_instruction_at_address(address)
-                //         .context("resolve relative address page")?,
-                // );
-
-                // let offset = immediate_from_instruction_at_address(address + 4)
-                //     .context("resolve relative address offset")?;
-
-                // address = (page
-                //     .checked_add_signed(offset)
-                //     .ok_or(anyhow!("failed checked add")));
             }
 
-            // #[cfg(target_arch = "aarch64")]
-            // &Action::ResolvePageAlignedRelativeAddress {} => {}
-            _ => unimplemented!(),
+            Action::Custom { name } => {
+                let Some(custom_action) = custom_actions
+                    .and_then(|actions| actions.iter().find_map(|(k, v)| (k == name).then_some(v)))
+                else {
+                    bail!("Expected custom function {name} to exist");
+                };
+
+                address = custom_action(address)?;
+            }
+
+            unknown_action => {
+                bail!(
+                    "action {:?} is not implemented for your platform",
+                    unknown_action
+                );
+            }
         }
     }
 
