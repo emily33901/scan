@@ -1,3 +1,4 @@
+use std::ops::Range;
 use windows::{
     core::HSTRING,
     Win32::{
@@ -17,7 +18,12 @@ pub struct Module {
 use anyhow::Result;
 
 impl Module {
-    pub fn code_range(&self) -> (usize, usize) {
+    pub fn code_section_address_range(&self) -> Range<usize> {
+        let (start, size) = self.code_range();
+        start..start + size;
+    }
+
+    fn code_range(&self) -> (usize, usize) {
         unsafe {
             let dos_header = (self.address as *const IMAGE_DOS_HEADER).as_ref().unwrap();
             let nt_header = ((self.address + dos_header.e_lfanew as usize)

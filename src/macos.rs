@@ -8,6 +8,7 @@ use object::read::macho::MachHeader;
 use object::read::macho::Segment;
 use object::LittleEndian;
 use std::ffi::CStr;
+use std::ops::Range;
 
 pub struct Module {
     handle: usize,
@@ -16,6 +17,11 @@ pub struct Module {
 }
 
 impl Module {
+    pub fn code_section_address_range(&self) -> Range<usize> {
+        let (start, size) = self.code_range;
+        start..start + size
+    }
+
     fn code_slice(&self) -> &[u8] {
         let (start, size) = self.code_range;
         unsafe { std::slice::from_raw_parts(start as *const u8, size) }
@@ -117,8 +123,3 @@ impl Drop for Module {
 }
 
 use anyhow::Result;
-
-#[cfg(target_arch = "aarch64")]
-pub fn resolve_relative_address(addr: usize, offset: usize) -> usize {
-    todo!("Not implemented for arm64 macos")
-}
