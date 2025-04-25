@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, OnceLock, Weak},
 };
 
+use anyhow::{bail, ensure, Result};
 use parking_lot::Mutex;
 
 #[derive(Debug)]
@@ -59,15 +60,25 @@ impl HookInstance {
         unsafe { *self.original_table.wrapping_add(index) }
     }
 
-    pub fn hook_function(&mut self, index: usize, f: *const ()) {
-        assert!(index < self.new_table.len());
+    pub fn hook_function(&mut self, index: usize, f: *const ()) -> Result<()> {
+        ensure_range(index, self.new_table.len())?;
         self.new_table[index] = f;
+        Ok(())
     }
 
-    pub fn unhook_function(&mut self, index: usize) {
-        assert!(index < self.new_table.len());
+    pub fn unhook_function(&mut self, index: usize) -> Result<()> {
+        ensure_range(index, self.new_table.len())?;
         self.new_table[index] = unsafe { *self.original_table.wrapping_add(index) };
+        Ok(())
     }
+}
+
+fn ensure_range(index: usize, max: usize) -> Result<()> {
+    if index > max {
+        bail!("index {index} is outside the table len {max}");
+    }
+
+    Ok(())
 }
 
 impl Drop for HookInstance {
@@ -113,21 +124,21 @@ impl HookFunction {
         hook_instance
     }
 
-    pub fn new<T>(instance: *mut T, index: usize, f: *const ()) -> Self {
+    pub fn new<T>(instance: *mut T, index: usize, f: *const ()) -> Result<Self> {
         let instance = instance as *mut ();
         let instance_hook = Self::get_or_make_instance_hook(instance);
         let original_function = {
             let mut instance_hook = instance_hook.lock();
-            instance_hook.hook_function(index, f);
+            instance_hook.hook_function(index, f)?;
             instance_hook.original_function(index)
         };
 
-        Self {
+        Ok(Self {
             index,
             instance_hook,
             original_function,
             instance,
-        }
+        })
     }
 
     pub fn original(&self) -> *const () {
@@ -140,6 +151,6 @@ unsafe impl Sync for HookFunction {}
 
 impl Drop for HookFunction {
     fn drop(&mut self) {
-        self.instance_hook.lock().unhook_function(self.index)
+        let _ = self.instance_hook.lock().unhook_function(self.index);
     }
 }
