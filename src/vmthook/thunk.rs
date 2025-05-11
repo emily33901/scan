@@ -104,9 +104,7 @@ where
 
             // Bake in the id and the pointer to thunk.
             let const_id = builder.ins().iconst(types::I64, id as i64);
-            let thunk_id = builder.ins().iconst(types::I64, unsafe {
-                std::mem::transmute::<*const (), i64>(self.thunk())
-            });
+            let thunk_id = builder.ins().iconst(types::I64, self.thunk() as i64);
 
             // Build up the params that we are going to pass to the thunk
             // This is the id, followed by this, followed by $($Args,)*
@@ -132,7 +130,7 @@ where
         module.finalize_definitions()?;
 
         let code_ptr = module.get_finalized_function(trampoline_id);
-        Ok(unsafe { std::mem::transmute(code_ptr) })
+        Ok(unsafe { std::mem::transmute::<*const u8, *const ()>(code_ptr) })
     }
 }
 
@@ -239,6 +237,7 @@ macro_rules! impl_func {
 
                             drop(h);
 
+                            #[allow(clippy::missing_transmute_annotations)]
                             (
                                 std::mem::transmute(closure),
                                 std::mem::transmute(original_function),

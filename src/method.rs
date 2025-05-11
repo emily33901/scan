@@ -9,7 +9,7 @@ pub mod x86_64;
 
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 
 pub type CustomActionFn<'a> = Box<dyn Fn(usize) -> Result<usize> + 'a>;
