@@ -34,7 +34,7 @@ impl HookInstance {
         static HOOKED_INSTANCES: OnceLock<Mutex<HashMap<Instance, Weak<Mutex<HookInstance>>>>> =
             OnceLock::new();
 
-        let hooked_instances = HOOKED_INSTANCES.get_or_init(|| Default::default());
+        let hooked_instances = HOOKED_INSTANCES.get_or_init(Default::default);
 
         let hooked_instances = hooked_instances.lock();
         hooked_instances
@@ -85,9 +85,7 @@ impl HookInstance {
 
         let table_len = unsafe { Self::count_funcs(original_table) };
         let new_table: Box<_> = unsafe { slice::from_raw_parts(original_table, table_len) }
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
+            .to_vec()
             .into_boxed_slice();
 
         unsafe { Self::replace_table_pointer(instance, new_table.as_ptr()) };
