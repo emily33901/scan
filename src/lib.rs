@@ -14,8 +14,8 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub use macos::Module;
+
 mod vmthook;
 
-use anyhow::Result;
-
+pub use vmthook::thunk::call_original;
 pub use vmthook::HookFunction;
