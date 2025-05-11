@@ -9,7 +9,9 @@ pub mod x86_64;
 
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Result};
+// NOTE(emily): Context used on arm64
+#[allow(unused_imports)]
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub type CustomActionFn<'a> = Box<dyn Fn(usize) -> Result<usize> + 'a>;
