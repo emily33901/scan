@@ -21,13 +21,13 @@ impl<T> AsCraneliftAbi for *mut T {
 
 impl<T> AsCraneliftAbi for &mut T {
     fn as_cranelift_abi() -> AbiParam {
-        AbiParam::new(types::R64)
+        AbiParam::new(types::I64)
     }
 }
 
 impl<T> AsCraneliftAbi for &T {
     fn as_cranelift_abi() -> AbiParam {
-        AbiParam::new(types::R64)
+        AbiParam::new(types::I64)
     }
 }
 
