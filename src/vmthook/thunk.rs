@@ -62,18 +62,16 @@ where
     R: 'static,
     T: 'static,
     Args: 'static,
+    Self: 'static,
 {
     fn into_raw_closure(self) -> *const dyn Fn();
 
+    /// Returns the thunk associated with this closure.
+    ///
     fn thunk(&self) -> *const ();
 
     fn unique_name(&self) -> String {
-        format!(
-            "trampoline_{}_{}_{}",
-            std::any::type_name::<R>(),
-            std::any::type_name::<T>(),
-            std::any::type_name::<Args>(),
-        )
+        format!("trampoline_{:?}", std::any::TypeId::of::<Self>())
     }
 
     /// This is the signature of the rust thunk that is returned from [`Self::thunk`]
@@ -82,7 +80,8 @@ where
     /// This is the signature of the original function.
     fn original_cranelift_sig(&self, module: &mut JITModule) -> cranelift::prelude::Signature;
 
-    /// Make a trampoline for this closure
+    /// Make a trampoline for this closure. This closure has the address of the thunk and the id
+    /// baked in.
     fn make_trampoline(&self, module: &mut JITModule, id: usize) -> Result<*const ()> {
         // Signature of the trampoline that we are going to be swapping into place of the original fn
         let original_sig = { self.original_cranelift_sig(module) };
