@@ -18,4 +18,5 @@ pub use macos::Module;
 mod vmthook;
 
 pub use vmthook::thunk::call_original;
+pub use vmthook::thunk::AsCraneliftAbi;
 pub use vmthook::HookFunction;
