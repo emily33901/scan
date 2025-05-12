@@ -7,56 +7,6 @@ use std::sync::Arc;
 
 use super::HookInstance;
 
-impl<T> AsCraneliftAbi for *const T {
-    fn as_cranelift_abi() -> AbiParam {
-        AbiParam::new(types::I64)
-    }
-}
-
-impl<T> AsCraneliftAbi for *mut T {
-    fn as_cranelift_abi() -> AbiParam {
-        AbiParam::new(types::I64)
-    }
-}
-
-impl<T> AsCraneliftAbi for &mut T {
-    fn as_cranelift_abi() -> AbiParam {
-        AbiParam::new(types::I64)
-    }
-}
-
-impl<T> AsCraneliftAbi for &T {
-    fn as_cranelift_abi() -> AbiParam {
-        AbiParam::new(types::I64)
-    }
-}
-
-impl AsCraneliftAbi for f32 {
-    fn as_cranelift_abi() -> AbiParam {
-        AbiParam::new(types::F32)
-    }
-}
-
-impl AsCraneliftAbi for f64 {
-    fn as_cranelift_abi() -> AbiParam {
-        AbiParam::new(types::F64)
-    }
-}
-
-impl AsCraneliftAbi for usize {
-    fn as_cranelift_abi() -> AbiParam {
-        AbiParam::new(types::I64)
-    }
-}
-
-pub trait AsCraneliftAbi {
-    fn as_cranelift_abi() -> AbiParam;
-}
-
-fn cranelift_abi<T: AsCraneliftAbi>() -> AbiParam {
-    T::as_cranelift_abi()
-}
-
 pub trait ThunkableClosure<R, T, Args>
 where
     R: 'static,
@@ -135,10 +85,30 @@ where
 
 use paste::paste;
 
+/// [`Call`] is implemented for `_FuncContext<A...>`.
 pub trait Call<R: 'static, T: 'static, Args: 'static> {
     fn call(&self, this: &mut T, args: Args) -> R;
 }
 
+/// impl_func implements [`ThunkableClosure`] for any number of parameters.
+/// In addition it also creates some other types and structs that are used in the call to the closure:
+///
+/// * `_FuncContext<A...>` which holds the hook instance and the original function pointer.
+///
+/// It also implements [`Call`] for the `_FuncContext<A...>` type, such that you can pass it to
+///  [`call_original`].
+///
+/// ```rs
+/// // ...
+/// |ctx, this, a: usize, b: usize| -> usize {
+///     call_original(ctx, this, (a, b))
+/// }
+/// // ...
+/// ```
+///
+/// This is loosely based on the
+/// [`NativeFunc` implementation from Rhai](https://github.com/rhaiscript/rhai/blob/main/src/func/register.rs#L81).
+///
 macro_rules! impl_func {
     ($($args:ident: $Args:ident),*) => {
         paste! {
@@ -334,3 +304,63 @@ impl Drop for TrampolineStorage {
         // module.free_memory();
     }
 }
+
+pub trait AsCraneliftAbi {
+    fn as_cranelift_abi() -> AbiParam;
+}
+
+/// Get the cranelift abi for a type T
+fn cranelift_abi<T: AsCraneliftAbi>() -> AbiParam {
+    T::as_cranelift_abi()
+}
+
+// Implement AsCraneliftAbi for a bunch of types
+
+impl<T> AsCraneliftAbi for *const T {
+    fn as_cranelift_abi() -> AbiParam {
+        AbiParam::new(types::I64)
+    }
+}
+
+impl<T> AsCraneliftAbi for *mut T {
+    fn as_cranelift_abi() -> AbiParam {
+        AbiParam::new(types::I64)
+    }
+}
+
+impl<T> AsCraneliftAbi for &mut T {
+    fn as_cranelift_abi() -> AbiParam {
+        AbiParam::new(types::I64)
+    }
+}
+
+impl<T> AsCraneliftAbi for &T {
+    fn as_cranelift_abi() -> AbiParam {
+        AbiParam::new(types::I64)
+    }
+}
+
+macro_rules! cranelift_abi {
+    ($t:ty, $abi:ident) => {
+        impl AsCraneliftAbi for $t {
+            fn as_cranelift_abi() -> AbiParam {
+                AbiParam::new(types::$abi)
+            }
+        }
+    };
+}
+
+cranelift_abi!(f32, F32);
+cranelift_abi!(f64, F64);
+
+cranelift_abi!(usize, I64);
+cranelift_abi!(isize, I64);
+
+cranelift_abi!(u32, I32);
+cranelift_abi!(i32, I32);
+
+cranelift_abi!(u16, I16);
+cranelift_abi!(i16, I16);
+
+cranelift_abi!(u8, I8);
+cranelift_abi!(i8, I8);
