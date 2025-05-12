@@ -162,6 +162,7 @@ impl Drop for HookInstance {
 unsafe impl Send for HookInstance {}
 unsafe impl Sync for HookInstance {}
 
+/// A hooked function in an instance's vtable.
 #[derive(Debug)]
 pub struct HookFunction {
     instance_hook: Arc<Mutex<HookInstance>>,
@@ -169,6 +170,32 @@ pub struct HookFunction {
 }
 
 impl HookFunction {
+    /// Hook a function in an instances vtable, providing a closure that will be called instead of the
+    /// original.
+    /// The closure provided should take a `ctx`, `&mut this` and arguments of the function being called.
+    ///
+    /// When the [`HookFunction`] is dropped, the function will be un-hooked.
+    ///
+    ///
+    /// All arguments of the function are expected to be able to be made into
+    /// [CraneLift basic types](https://docs.rs/cranelift-codegen/latest/cranelift_codegen/ir/types/index.html).
+    /// If you need to do this for a custom type, then consider implementing [`crate::AsCraneliftAbi`] for it.
+    ///
+    ///
+    /// # Example
+    ///
+    /// ```rs
+    ///  let instance_function_hook = HookFunction::new(
+    ///      instance,
+    ///      10,
+    ///      |ctx, this, arg: usize| -> usize {
+    ///         let arg = arg + 10
+    ///         call_original(ctx, this, (arg,))
+    ///     },
+    /// )
+    /// .unwrap();
+    /// ```
+    ///
     pub fn new<R: 'static, T: 'static, Args: 'static>(
         instance: *mut T,
         index: usize,
