@@ -408,7 +408,7 @@ dependencies = [
 [[package]]
 name = "mach2"
 version = "0.4.2"
-source = "git+https://github.com/JohnTitor/mach2#3cec3b366f47b05b6f2807d47822bb34e462d0fb"
+source = "git+https://github.com/JohnTitor/mach2?rev=3cec3b366f47b05b6f2807d47822bb34e462d0fb#3cec3b366f47b05b6f2807d47822bb34e462d0fb"
 dependencies = [
  "libc",
 ]
@@ -609,7 +609,7 @@ dependencies = [
  "disarm64_defn",
  "libc",
  "libloading",
- "mach2 0.4.2 (git+https://github.com/JohnTitor/mach2)",
+ "mach2 0.4.2 (git+https://github.com/JohnTitor/mach2?rev=3cec3b366f47b05b6f2807d47822bb34e462d0fb)",
  "mach_o",
  "object",
  "parking_lot",
