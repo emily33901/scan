@@ -11,6 +11,8 @@ fn main() -> anyhow::Result<()> {
 
     use anyhow::ensure;
 
+    const DISARM64_REVISION: &str = "4a5744dddcf7377172f7e33bd4483f7e31688171";
+
     let output_dir: PathBuf = std::env::var("OUT_DIR")?.into();
     std::env::set_current_dir(&output_dir)?;
 
@@ -19,8 +21,34 @@ fn main() -> anyhow::Result<()> {
 
     if !std::fs::exists("disarm64")? {
         let mut command = Command::new("git");
-        command.args(["clone", "https://github.com/kromych/disarm64"]);
+        command.args([
+            "clone",
+            "--no-checkout",
+            "https://github.com/kromych/disarm64",
+        ]);
 
+        ensure!(command.spawn()?.wait()?.success());
+    }
+
+    let current_revision = Command::new("git")
+        .args(["-C", "disarm64", "rev-parse", "HEAD"])
+        .output()?;
+    ensure!(current_revision.status.success());
+    if String::from_utf8(current_revision.stdout)?.trim() != DISARM64_REVISION {
+        let mut command = Command::new("git");
+        command.args([
+            "-C",
+            "disarm64",
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            DISARM64_REVISION,
+        ]);
+        ensure!(command.spawn()?.wait()?.success());
+
+        let mut command = Command::new("git");
+        command.args(["-C", "disarm64", "checkout", "--detach", "FETCH_HEAD"]);
         ensure!(command.spawn()?.wait()?.success());
     }
 
