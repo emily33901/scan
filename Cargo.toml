@@ -20,7 +20,7 @@ cranelift-jit = "0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
-mach2 = { git = "https://github.com/JohnTitor/mach2" }
+mach2 = { git = "https://github.com/JohnTitor/mach2", rev = "3cec3b366f47b05b6f2807d47822bb34e462d0fb" }
 mach_o = "0.1.2"
 # Needed for disarm64 decoder
 bitfield-struct = "0.10"
