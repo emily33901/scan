@@ -738,15 +738,20 @@ mod tests {
     }
 
     #[test]
-    fn warmed_dispatch_makes_no_framework_allocations() {
+    fn warmed_trampoline_dispatch_makes_no_framework_allocations() {
         let dispatch = unsafe { make_dispatch(|_: &Target, _: u32| {}, 18) };
+        let trampoline = TrampolineStorage::global()
+            .unwrap()
+            .make_trampoline(&*dispatch, HookId(18))
+            .unwrap();
+        let function: unsafe extern "C" fn(*mut Target, u32) -> u32 =
+            unsafe { std::mem::transmute(trampoline) };
         let mut target = Target {
             original_calls: AtomicU32::new(0),
         };
-        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 0) }, 1);
+        assert_eq!(unsafe { function(&mut target, 0) }, 1);
 
-        let (result, allocations) =
-            allocations_during(|| unsafe { direct_dispatch(&*dispatch, &mut target, 41) });
+        let (result, allocations) = allocations_during(|| unsafe { function(&mut target, 41) });
 
         assert_eq!(result, 42);
         assert_eq!(allocations, 0);
