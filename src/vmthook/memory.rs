@@ -52,6 +52,7 @@ impl MemoryMap for ProcessMemoryMap {
         use windows::Win32::System::Memory::{
             VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ,
             PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
+            PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
         };
 
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
@@ -87,11 +88,22 @@ impl MemoryMap for ProcessMemoryMap {
             ]
             .iter()
             .any(|flag| protection.contains(*flag));
+        let readable = accessible
+            && [
+                PAGE_READONLY,
+                PAGE_READWRITE,
+                PAGE_WRITECOPY,
+                PAGE_EXECUTE_READ,
+                PAGE_EXECUTE_READWRITE,
+                PAGE_EXECUTE_WRITECOPY,
+            ]
+            .iter()
+            .any(|flag| protection.contains(*flag));
 
         Ok(MemoryRegion {
             start,
             end,
-            readable: accessible && protection != PAGE_EXECUTE,
+            readable,
             executable,
         })
     }
