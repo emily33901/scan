@@ -37,7 +37,9 @@ pub(crate) fn direct_branch_target(address: usize, instruction: u32) -> Result<u
 
 #[cfg(test)]
 mod tests {
-    use super::{direct_branch_target, page_aligned_relative_target};
+    use super::{
+        direct_branch_target, page_aligned_relative_target, page_pair_instruction_address,
+    };
 
     #[test]
     fn adrp_uses_the_current_instruction_page() {
