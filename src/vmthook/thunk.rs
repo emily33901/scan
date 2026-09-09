@@ -1,4 +1,3 @@
-use anyhow::{anyhow, Result};
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
@@ -12,6 +11,23 @@ use std::{
 };
 
 use super::{HookDiagnostics, HookId, HookStatus};
+
+#[derive(Debug)]
+pub(super) enum TrampolineError {
+    Initialization(String),
+    Compilation(String),
+    Finalization(String),
+}
+
+impl std::fmt::Display for TrampolineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Initialization(message)
+            | Self::Compilation(message)
+            | Self::Finalization(message) => formatter.write_str(message),
+        }
+    }
+}
 
 mod sealed {
     pub trait Abi {}
@@ -294,18 +310,21 @@ pub(super) struct TrampolineStorage {
 }
 
 impl TrampolineStorage {
-    fn new() -> Result<Self> {
-        let builder = JITBuilder::new(cranelift_module::default_libcall_names())?;
+    fn new() -> std::result::Result<Self, TrampolineError> {
+        let builder = JITBuilder::new(cranelift_module::default_libcall_names())
+            .map_err(|error| TrampolineError::Initialization(error.to_string()))?;
         Ok(Self {
             module: Mutex::new(JITModule::new(builder)),
         })
     }
 
-    pub(super) fn global() -> Result<&'static Self> {
-        static STORAGE: OnceLock<Result<TrampolineStorage, String>> = OnceLock::new();
+    pub(super) fn global() -> std::result::Result<&'static Self, TrampolineError> {
+        // DEFERRED(vmthook): validate Cranelift executable-memory allocation and
+        // MAP_JIT entitlements inside the signed production Ableton host on macOS.
+        static STORAGE: OnceLock<std::result::Result<TrampolineStorage, String>> = OnceLock::new();
         match STORAGE.get_or_init(|| Self::new().map_err(|error| error.to_string())) {
             Ok(storage) => Ok(storage),
-            Err(error) => Err(anyhow!("failed to initialize trampoline JIT: {error}")),
+            Err(error) => Err(TrampolineError::Initialization(error.clone())),
         }
     }
 
@@ -313,7 +332,7 @@ impl TrampolineStorage {
         &self,
         dispatch: &dyn DispatchControl,
         hook_id: HookId,
-    ) -> Result<*const ()> {
+    ) -> std::result::Result<*const (), TrampolineError> {
         let mut module = self.module.lock();
         let original_sig = dispatch.original_cranelift_sig(&mut module);
         let thunk_sig = dispatch.thunk_cranelift_sig(&mut module);
@@ -344,10 +363,16 @@ impl TrampolineStorage {
             builder.ins().return_(&results);
         }
         let name = format!("vmthook_{}", hook_id.0);
-        let function = module.declare_function(&name, Linkage::Local, &ctx.func.signature)?;
-        module.define_function(function, &mut ctx)?;
+        let function = module
+            .declare_function(&name, Linkage::Local, &ctx.func.signature)
+            .map_err(|error| TrampolineError::Compilation(error.to_string()))?;
+        module
+            .define_function(function, &mut ctx)
+            .map_err(|error| TrampolineError::Compilation(error.to_string()))?;
         module.clear_context(&mut ctx);
-        module.finalize_definitions()?;
+        module
+            .finalize_definitions()
+            .map_err(|error| TrampolineError::Finalization(error.to_string()))?;
         Ok(module.get_finalized_function(function).cast())
     }
 }

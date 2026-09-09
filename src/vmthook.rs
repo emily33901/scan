@@ -13,13 +13,12 @@ use std::{
     },
 };
 
-use anyhow::Result;
 use memory::{
     checked_pointer_address, ensure_executable, ensure_readable, ensure_writable, MemoryMap,
     ProcessMemoryMap,
 };
 use parking_lot::Mutex;
-use thunk::{DispatchControl, ThunkablePreHook, TrampolineStorage};
+use thunk::{DispatchControl, ThunkablePreHook, TrampolineError, TrampolineStorage};
 
 static NEXT_HOOK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -40,29 +39,106 @@ impl Default for HookOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookError {
-    InvalidPointer(String),
-    InvalidVtable(String),
-    SlotOutOfRange { slot: usize, len: usize },
-    DuplicateHook { instance: usize, slot: usize },
-    VptrConflict { expected: usize, actual: usize },
+    NullPointer {
+        what: &'static str,
+    },
+    MisalignedPointer {
+        what: &'static str,
+        address: usize,
+    },
+    UnreadableObject {
+        address: usize,
+    },
+    UnwritableObject {
+        address: usize,
+    },
+    UnreadableVtable {
+        address: usize,
+    },
+    AddressOverflow {
+        what: &'static str,
+    },
+    TerminatorLimit {
+        max_slots: usize,
+    },
+    TerminatorMappingBoundary {
+        slot: usize,
+    },
+    InvalidPrefix {
+        address: usize,
+    },
+    NullOriginal {
+        slot: usize,
+    },
+    NonExecutableOriginal {
+        slot: usize,
+        address: usize,
+    },
+    SlotOutOfRange {
+        slot: usize,
+        len: usize,
+    },
+    DuplicateHook {
+        instance: usize,
+        slot: usize,
+        existing: HookId,
+    },
+    VptrConflict {
+        expected: usize,
+        actual: usize,
+    },
     InstanceRestored,
     HookNotFound(HookId),
     UnsupportedTarget,
-    Jit(String),
+    JitInitialization(String),
+    JitCompilation(String),
+    JitFinalization(String),
 }
 
 impl fmt::Display for HookError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPointer(message) | Self::InvalidVtable(message) | Self::Jit(message) => {
-                f.write_str(message)
+            Self::NullPointer { what } => write!(f, "{what} pointer is null"),
+            Self::MisalignedPointer { what, address } => {
+                write!(f, "{what} pointer {address:#x} is not pointer-aligned")
             }
+            Self::UnreadableObject { address } => {
+                write!(f, "object vptr cell at {address:#x} is not readable")
+            }
+            Self::UnwritableObject { address } => {
+                write!(f, "object vptr cell at {address:#x} is not writable")
+            }
+            Self::UnreadableVtable { address } => {
+                write!(f, "vtable memory at {address:#x} is not readable")
+            }
+            Self::AddressOverflow { what } => write!(f, "{what} address arithmetic overflow"),
+            Self::TerminatorLimit { max_slots } => write!(
+                f,
+                "vtable has no null terminator within the {max_slots}-slot limit"
+            ),
+            Self::TerminatorMappingBoundary { slot } => write!(
+                f,
+                "vtable mapping boundary reached at slot {slot} before its null terminator"
+            ),
+            Self::InvalidPrefix { address } => {
+                write!(f, "vtable ABI prefix at {address:#x} is unreadable")
+            }
+            Self::NullOriginal { slot } => write!(f, "original function in slot {slot} is null"),
+            Self::NonExecutableOriginal { slot, address } => write!(
+                f,
+                "original function in slot {slot} at {address:#x} is not executable"
+            ),
             Self::SlotOutOfRange { slot, len } => {
                 write!(f, "vtable slot {slot} is outside table length {len}")
             }
-            Self::DuplicateHook { instance, slot } => write!(
+            Self::DuplicateHook {
+                instance,
+                slot,
+                existing,
+            } => write!(
                 f,
-                "vtable slot {slot} on instance {instance:#x} is already hooked"
+                "vtable slot {slot} on instance {instance:#x} is already hooked by {}",
+                existing.0
             ),
             Self::VptrConflict { expected, actual } => write!(
                 f,
@@ -73,6 +149,11 @@ impl fmt::Display for HookError {
             }
             Self::HookNotFound(id) => write!(f, "hook {} was not found", id.0),
             Self::UnsupportedTarget => f.write_str("vtable hooking is unsupported on this target"),
+            Self::JitInitialization(message) => {
+                write!(f, "failed to initialize trampoline JIT: {message}")
+            }
+            Self::JitCompilation(message) => write!(f, "failed to compile trampoline: {message}"),
+            Self::JitFinalization(message) => write!(f, "failed to finalize trampoline: {message}"),
         }
     }
 }
@@ -80,6 +161,14 @@ impl fmt::Display for HookError {
 impl Error for HookError {}
 
 pub type HookResult<T> = std::result::Result<T, HookError>;
+
+fn map_trampoline_error(error: TrampolineError) -> HookError {
+    match error {
+        TrampolineError::Initialization(message) => HookError::JitInitialization(message),
+        TrampolineError::Compilation(message) => HookError::JitCompilation(message),
+        TrampolineError::Finalization(message) => HookError::JitFinalization(message),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HookId(u64);
@@ -185,7 +274,7 @@ impl ClonedVtable {
         table_len: usize,
         abi: VtableAbi,
         map: &M,
-    ) -> Result<Self> {
+    ) -> HookResult<Self> {
         let prefix_entries = abi.prefix_entries();
         let mut entries = Vec::with_capacity(prefix_entries + table_len);
         let pointer_size = size_of::<*const ()>();
@@ -193,17 +282,28 @@ impl ClonedVtable {
         for distance in (1..=prefix_entries).rev() {
             let offset = distance
                 .checked_mul(pointer_size)
-                .ok_or_else(|| anyhow::anyhow!("vtable prefix address arithmetic overflow"))?;
-            let address = (original_table as usize)
-                .checked_sub(offset)
-                .ok_or_else(|| anyhow::anyhow!("vtable prefix address arithmetic overflow"))?;
-            ensure_readable(map, address, pointer_size)?;
+                .ok_or(HookError::AddressOverflow {
+                    what: "vtable prefix",
+                })?;
+            let address = (original_table as usize).checked_sub(offset).ok_or(
+                HookError::AddressOverflow {
+                    what: "vtable prefix",
+                },
+            )?;
+            ensure_readable(map, address, pointer_size)
+                .map_err(|_| HookError::InvalidPrefix { address })?;
             entries.push(unsafe { ptr::read(address as *const *const ()) });
         }
 
         for index in 0..table_len {
-            let address = checked_pointer_address(original_table as usize, index)?;
-            ensure_readable(map, address, pointer_size)?;
+            let address =
+                checked_pointer_address(original_table as usize, index).map_err(|_| {
+                    HookError::AddressOverflow {
+                        what: "vtable entry",
+                    }
+                })?;
+            ensure_readable(map, address, pointer_size)
+                .map_err(|_| HookError::UnreadableVtable { address })?;
             entries.push(unsafe { ptr::read(address as *const *const ()) });
         }
 
@@ -260,30 +360,26 @@ impl InstanceState {
         let base = table as usize;
         let region = map
             .region_containing(base)
-            .map_err(|error| HookError::InvalidVtable(error.to_string()))?;
+            .map_err(|_| HookError::UnreadableVtable { address: base })?;
         if !region.readable || !region.contains(base, size_of::<*const ()>()) {
-            return Err(HookError::InvalidVtable(
-                "vtable does not begin in readable memory".into(),
-            ));
+            return Err(HookError::UnreadableVtable { address: base });
         }
         // DEFERRED(vmthook): exact C++ vtable lengths are ABI- and class-specific.
         // Keep the observed null-terminator heuristic, but constrain it to one mapping
         // and a hard slot cap so an unfamiliar table fails closed.
         for index in 0..max_slots {
-            let address = checked_pointer_address(base, index)
-                .map_err(|error| HookError::InvalidVtable(error.to_string()))?;
+            let address =
+                checked_pointer_address(base, index).map_err(|_| HookError::AddressOverflow {
+                    what: "vtable entry",
+                })?;
             if !region.contains(address, size_of::<*const ()>()) {
-                return Err(HookError::InvalidVtable(
-                    "vtable mapping boundary reached before its null terminator".into(),
-                ));
+                return Err(HookError::TerminatorMappingBoundary { slot: index });
             }
             if unsafe { ptr::read(address as *const *const ()) }.is_null() {
                 return Ok(index);
             }
         }
-        Err(HookError::InvalidVtable(format!(
-            "vtable has no null terminator within the {max_slots}-slot limit"
-        )))
+        Err(HookError::TerminatorLimit { max_slots })
     }
 
     unsafe fn get_table<M: MemoryMap>(
@@ -291,10 +387,16 @@ impl InstanceState {
         map: &M,
     ) -> HookResult<*const *const ()> {
         validate_pointer(instance as usize, "instance")?;
-        ensure_readable(map, instance as usize, size_of::<*const *const ()>())
-            .map_err(|error| HookError::InvalidPointer(error.to_string()))?;
-        ensure_writable(map, instance as usize, size_of::<*const *const ()>())
-            .map_err(|error| HookError::InvalidPointer(error.to_string()))?;
+        ensure_readable(map, instance as usize, size_of::<*const *const ()>()).map_err(|_| {
+            HookError::UnreadableObject {
+                address: instance as usize,
+            }
+        })?;
+        ensure_writable(map, instance as usize, size_of::<*const *const ()>()).map_err(|_| {
+            HookError::UnwritableObject {
+                address: instance as usize,
+            }
+        })?;
         let cell = unsafe { &*(instance as *const AtomicPtr<*const ()>) };
         let table = cell.load(Ordering::Acquire).cast_const();
         validate_pointer(table as usize, "vtable")?;
@@ -305,6 +407,23 @@ impl InstanceState {
         let map = ProcessMemoryMap;
         let original_table = unsafe { Self::get_table(instance, &map)? };
         let table_len = unsafe { Self::count_funcs(original_table, max_slots, &map)? };
+        for slot in 0..table_len {
+            let address = checked_pointer_address(original_table as usize, slot).map_err(|_| {
+                HookError::AddressOverflow {
+                    what: "vtable entry",
+                }
+            })?;
+            let original = unsafe { ptr::read(address as *const *const ()) };
+            if original.is_null() {
+                return Err(HookError::NullOriginal { slot });
+            }
+            ensure_executable(&map, original as usize).map_err(|_| {
+                HookError::NonExecutableOriginal {
+                    slot,
+                    address: original as usize,
+                }
+            })?;
+        }
         Ok(Self {
             original_table,
             instance,
@@ -342,7 +461,6 @@ impl InstanceState {
                     &ProcessMemoryMap,
                 )
             }
-            .map_err(|error| HookError::InvalidVtable(error.to_string()))
         }
     }
 
@@ -380,16 +498,15 @@ fn ensure_range(index: usize, max: usize) -> HookResult<()> {
     Ok(())
 }
 
-fn validate_pointer(address: usize, description: &str) -> HookResult<()> {
+fn validate_pointer(address: usize, description: &'static str) -> HookResult<()> {
     if address == 0 {
-        return Err(HookError::InvalidPointer(format!(
-            "{description} pointer is null"
-        )));
+        return Err(HookError::NullPointer { what: description });
     }
     if address % align_of::<*const ()>() != 0 {
-        return Err(HookError::InvalidPointer(format!(
-            "{description} pointer {address:#x} is not pointer-aligned"
-        )));
+        return Err(HookError::MisalignedPointer {
+            what: description,
+            address,
+        });
     }
     Ok(())
 }
@@ -480,10 +597,11 @@ impl HookFunction {
     ) -> HookResult<Self> {
         let instance_key = Instance(instance.cast());
         let mut registry = registry().lock();
-        if registry.by_slot.contains_key(&(instance_key, index)) {
+        if let Some(&existing) = registry.by_slot.get(&(instance_key, index)) {
             return Err(HookError::DuplicateHook {
                 instance: instance as usize,
                 slot: index,
+                existing,
             });
         }
 
@@ -513,17 +631,24 @@ impl HookFunction {
             });
         }
         let original = state.original_function(index);
-        ensure_executable(&ProcessMemoryMap, original as usize)
-            .map_err(|error| HookError::InvalidVtable(error.to_string()))?;
+        if original.is_null() {
+            return Err(HookError::NullOriginal { slot: index });
+        }
+        ensure_executable(&ProcessMemoryMap, original as usize).map_err(|_| {
+            HookError::NonExecutableOriginal {
+                slot: index,
+                address: original as usize,
+            }
+        })?;
         // Complete every fallible table read before emitting unreachable JIT code.
         let mut generation = state.next_generation()?;
         let hook_id = HookId::next();
         let context: Arc<dyn DispatchControl> =
             Arc::from(unsafe { f.into_dispatch(original, hook_id) });
         let trampoline = TrampolineStorage::global()
-            .map_err(|error| HookError::Jit(error.to_string()))?
+            .map_err(map_trampoline_error)?
             .make_trampoline(&*context, hook_id)
-            .map_err(|error| HookError::Jit(error.to_string()))?;
+            .map_err(map_trampoline_error)?;
         *generation.function_entry_mut(index) = trampoline;
         let replacement = generation.address_point();
         state.generations.reserve(1);
@@ -665,10 +790,9 @@ impl HookRecord {
 pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
     let key = Instance(instance.cast());
     let registry = registry().lock();
-    let state = registry
-        .instances
-        .get(&key)
-        .ok_or(HookError::InvalidPointer("instance is not managed".into()))?;
+    let state = registry.instances.get(&key).ok_or(HookError::NullPointer {
+        what: "managed instance",
+    })?;
     let mut state = state.lock();
     if state.restored {
         return Err(HookError::InstanceRestored);
@@ -696,7 +820,7 @@ pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::bail;
+    use anyhow::{bail, Result};
     use memory::MemoryRegion;
     use std::sync::atomic::AtomicU32;
 
@@ -755,7 +879,7 @@ mod tests {
 
         let error = unsafe { InstanceState::count_funcs(entries.as_ptr(), 2, &map) }.unwrap_err();
 
-        assert!(error.to_string().contains("2-slot limit"));
+        assert_eq!(error, HookError::TerminatorLimit { max_slots: 2 });
     }
 
     #[test]
@@ -765,7 +889,7 @@ mod tests {
 
         let error = unsafe { InstanceState::count_funcs(entries.as_ptr(), 3, &map) }.unwrap_err();
 
-        assert!(error.to_string().contains("mapping boundary"));
+        assert_eq!(error, HookError::TerminatorMappingBoundary { slot: 2 });
     }
 
     #[test]
@@ -777,8 +901,37 @@ mod tests {
 
     #[test]
     fn rejects_null_and_misaligned_pointers() {
-        assert!(validate_pointer(0, "test").is_err());
-        assert!(validate_pointer(1, "test").is_err());
+        assert_eq!(
+            validate_pointer(0, "test"),
+            Err(HookError::NullPointer { what: "test" })
+        );
+        assert_eq!(
+            validate_pointer(1, "test"),
+            Err(HookError::MisalignedPointer {
+                what: "test",
+                address: 1
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unwritable_object_vptr_cell() {
+        let table = [ptr::null::<()>()];
+        let object_vptr = table.as_ptr();
+        let address = &object_vptr as *const _ as usize;
+        let map = TableMap {
+            region: MemoryRegion {
+                start: address,
+                end: address + size_of::<*const *const ()>(),
+                readable: true,
+                writable: false,
+                executable: false,
+            },
+        };
+
+        let error = unsafe { InstanceState::get_table((&object_vptr as *const _).cast(), &map) }
+            .unwrap_err();
+        assert_eq!(error, HookError::UnwritableObject { address });
     }
 
     #[test]
@@ -851,7 +1004,7 @@ mod tests {
             unsafe { ClonedVtable::copy_from(layout.as_ptr().add(1), 1, VtableAbi::Msvc64, &map) }
                 .unwrap_err();
 
-        assert!(error.to_string().contains("mapping"));
+        assert!(matches!(error, HookError::InvalidPrefix { .. }));
     }
 
     #[repr(C)]
@@ -927,7 +1080,9 @@ mod tests {
         let error =
             unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
                 .unwrap_err();
-        assert!(matches!(error, HookError::DuplicateHook { slot: 0, .. }));
+        assert!(
+            matches!(error, HookError::DuplicateHook { slot: 0, existing, .. } if existing == _hook.id())
+        );
     }
 
     #[test]
@@ -976,7 +1131,9 @@ mod tests {
         assert!(HookFunction::list_for_instance(target).is_empty());
         assert!(matches!(
             unsafe { restore_instance(target) },
-            Err(HookError::InvalidPointer(_))
+            Err(HookError::NullPointer {
+                what: "managed instance"
+            })
         ));
     }
 
