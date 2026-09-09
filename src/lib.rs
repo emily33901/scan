@@ -18,4 +18,7 @@ pub use macos::Module;
 mod vmthook;
 
 pub use vmthook::thunk::{AsCraneliftAbi, ThunkablePreHook};
-pub use vmthook::{HookDiagnostics, HookFunction, HookId, HookStatus};
+pub use vmthook::{
+    restore_instance, HookDiagnostics, HookError, HookFunction, HookId, HookInfo, HookOptions,
+    HookResult, HookStatus,
+};

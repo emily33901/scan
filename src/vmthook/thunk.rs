@@ -19,7 +19,7 @@ pub trait DispatchControl: Send + Sync {
     fn dispatcher_address(&self) -> *const ();
     fn thunk_cranelift_sig(&self, module: &mut JITModule) -> Signature;
     fn original_cranelift_sig(&self, module: &mut JITModule) -> Signature;
-    fn enabled(&self) -> &AtomicBool;
+    fn set_enabled(&self, enabled: bool) -> bool;
     fn diagnostics(&self) -> HookDiagnostics;
 }
 
@@ -50,7 +50,7 @@ impl Drop for BusyGuard<'_> {
 
 struct DispatchState {
     hook_id: HookId,
-    enabled: AtomicBool,
+    run_state: AtomicU8,
     busy: AtomicBool,
     invocations: AtomicU64,
     bypasses: AtomicU64,
@@ -59,10 +59,14 @@ struct DispatchState {
 }
 
 impl DispatchState {
+    const ENABLED: u8 = 0;
+    const DISABLED: u8 = 1;
+    const PANICKED: u8 = 2;
+
     fn new(hook_id: HookId) -> Self {
         Self {
             hook_id,
-            enabled: AtomicBool::new(true),
+            run_state: AtomicU8::new(Self::ENABLED),
             busy: AtomicBool::new(false),
             invocations: AtomicU64::new(0),
             bypasses: AtomicU64::new(0),
@@ -74,11 +78,44 @@ impl DispatchState {
     fn diagnostics(&self) -> HookDiagnostics {
         HookDiagnostics {
             hook_id: self.hook_id,
-            enabled: self.enabled.load(Ordering::Acquire),
+            enabled: self.run_state.load(Ordering::Acquire) == Self::ENABLED,
             invocations: self.invocations.load(Ordering::Relaxed),
             bypasses: self.bypasses.load(Ordering::Relaxed),
             panics: self.panics.load(Ordering::Relaxed),
             last_status: HookStatus::from_u8(self.last_status.load(Ordering::Relaxed)),
+        }
+    }
+
+    fn set_enabled(&self, enabled: bool) -> bool {
+        if enabled {
+            self.run_state
+                .compare_exchange(
+                    Self::DISABLED,
+                    Self::ENABLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+                || self.run_state.load(Ordering::Acquire) == Self::ENABLED
+        } else {
+            loop {
+                let state = self.run_state.load(Ordering::Acquire);
+                if state == Self::PANICKED || state == Self::DISABLED {
+                    return state == Self::DISABLED;
+                }
+                if self
+                    .run_state
+                    .compare_exchange(
+                        Self::ENABLED,
+                        Self::DISABLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
         }
     }
 }
@@ -122,7 +159,7 @@ macro_rules! impl_func {
                     {
                         let context = unsafe { &*context };
                         increment_saturated(&context.state.invocations);
-                        if !context.state.enabled.load(Ordering::Acquire) {
+                        if context.state.run_state.load(Ordering::Acquire) != DispatchState::ENABLED {
                             increment_saturated(&context.state.bypasses);
                             context.state.last_status.store(HookStatus::Disabled as u8, Ordering::Relaxed);
                             return unsafe { (context.original_fn)(this, $($args,)*) };
@@ -137,16 +174,24 @@ macro_rules! impl_func {
 
                         // Keep exclusivity through the original call so original-driven reentry bypasses.
                         let _busy = BusyGuard(&context.state.busy);
+                        if context.state.run_state.load(Ordering::Acquire) != DispatchState::ENABLED {
+                            increment_saturated(&context.state.bypasses);
+                            context.state.last_status.store(HookStatus::Disabled as u8, Ordering::Relaxed);
+                            return unsafe { (context.original_fn)(this, $($args,)*) };
+                        }
                         context.state.last_status.store(HookStatus::Running as u8, Ordering::Relaxed);
                         // DEFERRED(vmthook): expose a raw receiver before supporting concurrent
                         // handlers; `&TThis` relies on the current exclusive, non-mutating contract.
                         let handler_result = catch_unwind(AssertUnwindSafe(|| {
                             (context.handler)(unsafe { &*this }, $($args,)*);
                         }));
-                        if handler_result.is_err() {
+                        if let Err(payload) = handler_result {
                             increment_saturated(&context.state.panics);
-                            context.state.enabled.store(false, Ordering::Release);
+                            context.state.run_state.store(DispatchState::PANICKED, Ordering::Release);
                             context.state.last_status.store(HookStatus::Panicked as u8, Ordering::Relaxed);
+                            // A panic payload may itself panic while being dropped. Never let
+                            // that second panic cross the generated extern boundary.
+                            std::mem::forget(payload);
                         } else {
                             context.state.last_status.store(HookStatus::Ready as u8, Ordering::Relaxed);
                         }
@@ -175,7 +220,7 @@ macro_rules! impl_func {
                     signature
                 }
 
-                fn enabled(&self) -> &AtomicBool { &self.state.enabled }
+                fn set_enabled(&self, enabled: bool) -> bool { self.state.set_enabled(enabled) }
                 fn diagnostics(&self) -> HookDiagnostics { self.state.diagnostics() }
             }
 
@@ -475,7 +520,10 @@ mod tests {
                 };
             });
             entered.wait();
-            assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 20) }, 21);
+            assert_eq!(
+                unsafe { direct_dispatch(&*dispatch, target_address as *mut Target, 20) },
+                21
+            );
             release.wait();
         });
 

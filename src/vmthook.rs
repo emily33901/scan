@@ -3,23 +3,80 @@ pub mod thunk;
 
 use std::{
     collections::HashMap,
+    error::Error,
+    fmt,
     mem::{align_of, size_of},
     ptr,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, OnceLock, Weak,
+        atomic::{AtomicPtr, AtomicU64, Ordering},
+        Arc, OnceLock,
     },
 };
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use memory::{
     checked_pointer_address, ensure_executable, ensure_readable, MemoryMap, ProcessMemoryMap,
 };
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use thunk::{DispatchControl, ThunkablePreHook, TrampolineStorage};
 
-const DEFAULT_MAX_VTABLE_SLOTS: usize = 4096;
 static NEXT_HOOK_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookOptions {
+    pub name: Option<String>,
+    pub max_vtable_slots: usize,
+}
+
+impl Default for HookOptions {
+    fn default() -> Self {
+        Self {
+            name: None,
+            max_vtable_slots: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookError {
+    InvalidPointer(String),
+    InvalidVtable(String),
+    SlotOutOfRange { slot: usize, len: usize },
+    DuplicateHook { instance: usize, slot: usize },
+    VptrConflict { expected: usize, actual: usize },
+    InstanceRestored,
+    UnsupportedTarget,
+    Jit(String),
+}
+
+impl fmt::Display for HookError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPointer(message) | Self::InvalidVtable(message) | Self::Jit(message) => {
+                f.write_str(message)
+            }
+            Self::SlotOutOfRange { slot, len } => {
+                write!(f, "vtable slot {slot} is outside table length {len}")
+            }
+            Self::DuplicateHook { instance, slot } => write!(
+                f,
+                "vtable slot {slot} on instance {instance:#x} is already hooked"
+            ),
+            Self::VptrConflict { expected, actual } => write!(
+                f,
+                "instance vptr changed: expected {expected:#x}, found {actual:#x}"
+            ),
+            Self::InstanceRestored => {
+                f.write_str("restored hook instances cannot currently be hooked again")
+            }
+            Self::UnsupportedTarget => f.write_str("vtable hooking is unsupported on this target"),
+        }
+    }
+}
+
+impl Error for HookError {}
+
+pub type HookResult<T> = std::result::Result<T, HookError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HookId(u64);
@@ -28,6 +85,15 @@ impl HookId {
     fn next() -> Self {
         Self(NEXT_HOOK_ID.fetch_add(1, Ordering::Relaxed))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookInfo {
+    pub hook_id: HookId,
+    pub instance: usize,
+    pub slot: usize,
+    pub name: Option<String>,
+    pub diagnostics: HookDiagnostics,
 }
 
 #[repr(u8)]
@@ -70,7 +136,7 @@ enum VtableAbi {
 
 impl VtableAbi {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    fn current() -> Result<Self> {
+    fn current() -> HookResult<Self> {
         Ok(Self::Msvc64)
     }
 
@@ -78,7 +144,7 @@ impl VtableAbi {
         target_os = "macos",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    fn current() -> Result<Self> {
+    fn current() -> HookResult<Self> {
         // DEFERRED(vmthook): arm64e pointer authentication needs validation in Ableton.
         Ok(Self::Itanium64)
     }
@@ -90,8 +156,8 @@ impl VtableAbi {
             any(target_arch = "x86_64", target_arch = "aarch64")
         )
     )))]
-    fn current() -> Result<Self> {
-        bail!("vtable hooking is unsupported on this target")
+    fn current() -> HookResult<Self> {
+        Err(HookError::UnsupportedTarget)
     }
 
     const fn prefix_entries(self) -> usize {
@@ -142,10 +208,6 @@ impl ClonedVtable {
         })
     }
 
-    fn len(&self) -> usize {
-        self.storage.len() - self.prefix_entries
-    }
-
     fn address_point(&self) -> *const *const () {
         // SAFETY: construction always reserves `prefix_entries` elements first.
         unsafe { self.storage.as_ptr().add(self.prefix_entries) }
@@ -157,208 +219,213 @@ impl ClonedVtable {
 }
 
 #[repr(transparent)]
-#[derive(PartialEq, Eq, PartialOrd, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Instance(*mut ());
 unsafe impl Send for Instance {}
 unsafe impl Sync for Instance {}
 
-struct HookInstance {
+struct InstanceState {
     instance: *mut (),
     original_table: *const *const (),
-    new_table: ClonedVtable,
-    contexts: HashMap<usize, Box<dyn DispatchControl>>,
+    table_len: usize,
+    abi: VtableAbi,
+    generations: Vec<ClonedVtable>,
+    slots: HashMap<usize, HookId>,
+    restored: bool,
 }
 
-impl std::fmt::Debug for HookInstance {
+impl std::fmt::Debug for InstanceState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("HookInstance")
+            .debug_struct("InstanceState")
             .field("instance", &self.instance)
             .field("original_table", &self.original_table)
-            .field("new_table", &self.new_table)
-            .field("hooked_slots", &self.contexts.keys())
+            .field("generations", &self.generations.len())
+            .field("hooked_slots", &self.slots.keys())
             .finish()
     }
 }
 
-impl HookInstance {
-    fn all_hooked_instances() -> MutexGuard<'static, HashMap<Instance, Weak<Mutex<HookInstance>>>> {
-        static HOOKED_INSTANCES: OnceLock<Mutex<HashMap<Instance, Weak<Mutex<HookInstance>>>>> =
-            OnceLock::new();
-
-        let hooked_instances = HOOKED_INSTANCES.get_or_init(Default::default);
-
-        let hooked_instances = hooked_instances.lock();
-        hooked_instances
-    }
-
-    fn for_instance(instance: *mut ()) -> Result<Arc<Mutex<HookInstance>>> {
-        let mut hooked_instances = HookInstance::all_hooked_instances();
-
-        if let Some(hook) = hooked_instances
-            .get(&Instance(instance))
-            .and_then(|hook| hook.upgrade())
-        {
-            return Ok(hook);
-        }
-
-        let hook_instance = Arc::new(Mutex::new(HookInstance::new(instance)?));
-
-        hooked_instances.insert(Instance(instance), Arc::downgrade(&hook_instance));
-
-        Ok(hook_instance)
-    }
-
+impl InstanceState {
     unsafe fn count_funcs<M: MemoryMap>(
         table: *const *const (),
         max_slots: usize,
         map: &M,
-    ) -> Result<usize> {
+    ) -> HookResult<usize> {
         let base = table as usize;
-        let region = map.region_containing(base)?;
+        let region = map
+            .region_containing(base)
+            .map_err(|error| HookError::InvalidVtable(error.to_string()))?;
         if !region.readable || !region.contains(base, size_of::<*const ()>()) {
-            bail!("vtable does not begin in readable memory");
+            return Err(HookError::InvalidVtable(
+                "vtable does not begin in readable memory".into(),
+            ));
         }
         // DEFERRED(vmthook): exact C++ vtable lengths are ABI- and class-specific.
         // Keep the observed null-terminator heuristic, but constrain it to one mapping
         // and a hard slot cap so an unfamiliar table fails closed.
         for index in 0..max_slots {
-            let address = checked_pointer_address(base, index)?;
+            let address = checked_pointer_address(base, index)
+                .map_err(|error| HookError::InvalidVtable(error.to_string()))?;
             if !region.contains(address, size_of::<*const ()>()) {
-                bail!("vtable mapping boundary reached before its null terminator");
+                return Err(HookError::InvalidVtable(
+                    "vtable mapping boundary reached before its null terminator".into(),
+                ));
             }
             if unsafe { ptr::read(address as *const *const ()) }.is_null() {
                 return Ok(index);
             }
         }
-        bail!("vtable has no null terminator within the {max_slots}-slot limit")
+        Err(HookError::InvalidVtable(format!(
+            "vtable has no null terminator within the {max_slots}-slot limit"
+        )))
     }
 
-    unsafe fn get_table<M: MemoryMap>(instance: *const (), map: &M) -> Result<*const *const ()> {
+    unsafe fn get_table<M: MemoryMap>(
+        instance: *const (),
+        map: &M,
+    ) -> HookResult<*const *const ()> {
         validate_pointer(instance as usize, "instance")?;
-        ensure_readable(map, instance as usize, size_of::<*const *const ()>())?;
+        ensure_readable(map, instance as usize, size_of::<*const *const ()>())
+            .map_err(|error| HookError::InvalidPointer(error.to_string()))?;
         let table = unsafe { ptr::read(instance as *const *const *const ()) };
         validate_pointer(table as usize, "vtable")?;
         Ok(table)
     }
 
-    #[allow(dead_code)]
-    unsafe fn get_table_mut(instance: *mut ()) -> *mut *const () {
-        *(instance as *const *mut *const ())
-    }
-
-    unsafe fn replace_table_pointer(instance: *mut (), new_table: *const *const ()) {
-        let pointer_to_table = instance as *mut *const *const ();
-        *pointer_to_table = new_table;
-    }
-
-    pub fn new(instance: *mut ()) -> Result<Self> {
+    fn new(instance: *mut (), max_slots: usize) -> HookResult<Self> {
         let map = ProcessMemoryMap;
         let original_table = unsafe { Self::get_table(instance, &map)? };
-
-        let table_len =
-            unsafe { Self::count_funcs(original_table, DEFAULT_MAX_VTABLE_SLOTS, &map)? };
-        let new_table = unsafe {
-            ClonedVtable::copy_from(original_table, table_len, VtableAbi::current()?, &map)?
-        };
-
-        unsafe { Self::replace_table_pointer(instance, new_table.address_point()) };
-
+        let table_len = unsafe { Self::count_funcs(original_table, max_slots, &map)? };
         Ok(Self {
             original_table,
             instance,
-            new_table,
-            contexts: Default::default(),
+            table_len,
+            abi: VtableAbi::current()?,
+            generations: Vec::new(),
+            slots: HashMap::new(),
+            restored: false,
         })
     }
 
-    pub fn original_function(&self, index: usize) -> *const () {
-        unsafe { *self.original_table.wrapping_add(index) }
+    fn latest_table(&self) -> *const *const () {
+        self.generations
+            .last()
+            .map_or(self.original_table, ClonedVtable::address_point)
     }
 
-    pub fn hook_function(&mut self, index: usize, f: *const ()) -> Result<()> {
-        ensure_range(index, self.new_table.len())?;
-        let original = self.original_function(index);
-        ensure_executable(&ProcessMemoryMap, original as usize)?;
-        *self.new_table.function_entry_mut(index) = f;
-        Ok(())
+    fn original_function(&self, index: usize) -> *const () {
+        // SAFETY: installation validates index against the discovered baseline.
+        unsafe { *self.original_table.add(index) }
     }
 
-    pub fn unhook_function(&mut self, index: usize) -> Result<()> {
-        ensure_range(index, self.new_table.len())?;
-        *self.new_table.function_entry_mut(index) =
-            unsafe { *self.original_table.wrapping_add(index) };
-        Ok(())
-    }
-
-    unsafe fn hook_function_with_pre_hook<R: 'static, T: 'static, Args: 'static>(
-        &mut self,
-        index: usize,
-        f: impl ThunkablePreHook<R, T, Args>,
-        hook_id: HookId,
-    ) -> Result<()> {
-        ensure_range(index, self.new_table.len())?;
-        if self.contexts.contains_key(&index) {
-            bail!("vtable slot {index} is already hooked");
+    fn next_generation(&self) -> HookResult<ClonedVtable> {
+        if let Some(current) = self.generations.last() {
+            Ok(ClonedVtable {
+                storage: current.storage.clone(),
+                prefix_entries: current.prefix_entries,
+            })
+        } else {
+            unsafe {
+                ClonedVtable::copy_from(
+                    self.original_table,
+                    self.table_len,
+                    self.abi,
+                    &ProcessMemoryMap,
+                )
+            }
+            .map_err(|error| HookError::InvalidVtable(error.to_string()))
         }
-        let original = self.original_function(index);
-        ensure_executable(&ProcessMemoryMap, original as usize)?;
-        let context = unsafe { f.into_dispatch(original, hook_id) };
-        let trampoline = TrampolineStorage::global()?.make_trampoline(&*context, hook_id)?;
-        self.hook_function(index, trampoline)?;
-        self.contexts.insert(index, context);
-        Ok(())
     }
 
-    fn unhook_function_with_closure(&mut self, index: usize) -> Result<()> {
-        self.unhook_function(index)?;
-
-        self.contexts.remove(&index);
-
-        Ok(())
+    fn compare_exchange_vptr(
+        &self,
+        expected: *const *const (),
+        replacement: *const *const (),
+    ) -> HookResult<()> {
+        // DEFERRED(vmthook): this relies on aligned pointer atomicity when foreign
+        // callers load the vptr non-atomically; Rust cannot formally model that race.
+        let cell = unsafe { &*(self.instance as *const AtomicPtr<*const ()>) };
+        match cell.compare_exchange(
+            expected.cast_mut(),
+            replacement.cast_mut(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(actual) => Err(HookError::VptrConflict {
+                expected: expected as usize,
+                actual: actual as usize,
+            }),
+        }
     }
 }
 
-fn ensure_range(index: usize, max: usize) -> Result<()> {
+fn ensure_range(index: usize, max: usize) -> HookResult<()> {
     if index >= max {
-        bail!("index {index} is outside the table len {max}");
+        return Err(HookError::SlotOutOfRange {
+            slot: index,
+            len: max,
+        });
     }
 
     Ok(())
 }
 
-fn validate_pointer(address: usize, description: &str) -> Result<()> {
+fn validate_pointer(address: usize, description: &str) -> HookResult<()> {
     if address == 0 {
-        bail!("{description} pointer is null");
+        return Err(HookError::InvalidPointer(format!(
+            "{description} pointer is null"
+        )));
     }
     if address % align_of::<*const ()>() != 0 {
-        bail!("{description} pointer {address:#x} is not pointer-aligned");
+        return Err(HookError::InvalidPointer(format!(
+            "{description} pointer {address:#x} is not pointer-aligned"
+        )));
     }
     Ok(())
 }
 
-impl Drop for HookInstance {
-    fn drop(&mut self) {
-        unsafe { Self::replace_table_pointer(self.instance, self.original_table) };
-    }
+struct HookRecord {
+    instance: Instance,
+    slot: usize,
+    name: Option<String>,
+    context: Arc<dyn DispatchControl>,
 }
 
-unsafe impl Send for HookInstance {}
-unsafe impl Sync for HookInstance {}
+struct Registry {
+    instances: HashMap<Instance, Arc<Mutex<InstanceState>>>,
+    by_id: HashMap<HookId, HookRecord>,
+    by_slot: HashMap<(Instance, usize), HookId>,
+}
+
+fn registry() -> &'static Mutex<Registry> {
+    // DEFERRED(vmthook): this registry is process-global only within one linked
+    // copy of scan; coordinate it across dylibs if scan is linked more than once.
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        Mutex::new(Registry {
+            instances: HashMap::new(),
+            by_id: HashMap::new(),
+            by_slot: HashMap::new(),
+        })
+    })
+}
+
+unsafe impl Send for InstanceState {}
+unsafe impl Sync for InstanceState {}
 
 /// A hooked function in an instance's vtable.
-#[derive(Debug)]
 pub struct HookFunction {
-    instance_hook: Arc<Mutex<HookInstance>>,
-    index: usize,
+    hook_id: HookId,
+    context: Arc<dyn DispatchControl>,
 }
 
 impl HookFunction {
     /// Installs a pre-hook which runs before the captured original function.
     ///
-    /// When the [`HookFunction`] is dropped, the function will be un-hooked.
-    ///
-    ///
+    /// Dropping the returned handle does not remove or disable the hook. Hook
+    /// code, contexts, and vtable generations are retained for process lifetime.
     /// The original is invoked exactly once, even if the pre-hook panics. A panic
     /// permanently disables the handler. Nested and concurrent entries bypass the
     /// handler without blocking and call the original directly.
@@ -383,48 +450,171 @@ impl HookFunction {
         instance: *mut T,
         index: usize,
         f: impl ThunkablePreHook<R, T, Args>,
-    ) -> Result<Self> {
-        let instance_hook = HookInstance::for_instance(instance as *mut ())?;
-        let hook_id = HookId::next();
-        unsafe {
-            instance_hook
-                .lock()
-                .hook_function_with_pre_hook(index, f, hook_id)?;
+    ) -> HookResult<Self> {
+        unsafe { Self::new_pre_with_options(instance, index, f, HookOptions::default()) }
+    }
+
+    pub unsafe fn new_pre_with_options<R: 'static, T: 'static, Args: 'static>(
+        instance: *mut T,
+        index: usize,
+        f: impl ThunkablePreHook<R, T, Args>,
+        options: HookOptions,
+    ) -> HookResult<Self> {
+        let instance_key = Instance(instance.cast());
+        let mut registry = registry().lock();
+        if registry.by_slot.contains_key(&(instance_key, index)) {
+            return Err(HookError::DuplicateHook {
+                instance: instance as usize,
+                slot: index,
+            });
         }
 
-        Ok(Self {
-            index,
-            instance_hook,
-        })
+        let instance_state = match registry.instances.get(&instance_key) {
+            Some(state) => Arc::clone(state),
+            None => {
+                let state = Arc::new(Mutex::new(InstanceState::new(
+                    instance.cast(),
+                    options.max_vtable_slots,
+                )?));
+                registry.instances.insert(instance_key, Arc::clone(&state));
+                state
+            }
+        };
+        let mut state = instance_state.lock();
+        if state.restored {
+            // DEFERRED(vmthook): support re-hooking a restored live object after
+            // defining how foreign vptr changes establish a new baseline.
+            return Err(HookError::InstanceRestored);
+        }
+        ensure_range(index, state.table_len)?;
+        let expected = state.latest_table();
+        let actual = unsafe { InstanceState::get_table(instance.cast(), &ProcessMemoryMap)? };
+        if actual != expected {
+            return Err(HookError::VptrConflict {
+                expected: expected as usize,
+                actual: actual as usize,
+            });
+        }
+        let original = state.original_function(index);
+        ensure_executable(&ProcessMemoryMap, original as usize)
+            .map_err(|error| HookError::InvalidVtable(error.to_string()))?;
+        let hook_id = HookId::next();
+        let context: Arc<dyn DispatchControl> =
+            Arc::from(unsafe { f.into_dispatch(original, hook_id) });
+        let trampoline = TrampolineStorage::global()
+            .map_err(|error| HookError::Jit(error.to_string()))?
+            .make_trampoline(&*context, hook_id)
+            .map_err(|error| HookError::Jit(error.to_string()))?;
+        let mut generation = state.next_generation()?;
+        *generation.function_entry_mut(index) = trampoline;
+        let replacement = generation.address_point();
+        state.compare_exchange_vptr(expected, replacement)?;
+        state.generations.push(generation);
+        state.slots.insert(index, hook_id);
+
+        registry.by_slot.insert((instance_key, index), hook_id);
+        registry.by_id.insert(
+            hook_id,
+            HookRecord {
+                instance: instance_key,
+                slot: index,
+                name: options.name,
+                context: Arc::clone(&context),
+            },
+        );
+        Ok(Self { hook_id, context })
     }
 
     pub fn set_enabled(&self, enabled: bool) {
-        if let Some(context) = self.instance_hook.lock().contexts.get(&self.index) {
-            context.enabled().store(enabled, Ordering::Release);
-        }
+        self.context.set_enabled(enabled);
     }
 
-    pub fn diagnostics(&self) -> Option<HookDiagnostics> {
-        self.instance_hook
-            .lock()
-            .contexts
-            .get(&self.index)
-            .map(|context| context.diagnostics())
+    pub fn diagnostics(&self) -> HookDiagnostics {
+        self.context.diagnostics()
+    }
+
+    pub fn id(&self) -> HookId {
+        self.hook_id
+    }
+
+    pub fn lookup(hook_id: HookId) -> Option<HookInfo> {
+        let registry = registry().lock();
+        registry
+            .by_id
+            .get(&hook_id)
+            .map(|record| record.info(hook_id))
+    }
+
+    pub fn lookup_slot<T>(instance: *mut T, slot: usize) -> Option<HookInfo> {
+        let registry = registry().lock();
+        let id = *registry.by_slot.get(&(Instance(instance.cast()), slot))?;
+        registry.by_id.get(&id).map(|record| record.info(id))
+    }
+
+    pub fn list_for_instance<T>(instance: *mut T) -> Vec<HookInfo> {
+        let key = Instance(instance.cast());
+        let registry = registry().lock();
+        let mut hooks: Vec<_> = registry
+            .by_id
+            .iter()
+            .filter(|(_, record)| record.instance == key)
+            .map(|(&id, record)| record.info(id))
+            .collect();
+        hooks.sort_by_key(|info| info.slot);
+        hooks
     }
 }
 
-impl Drop for HookFunction {
-    fn drop(&mut self) {
-        self.instance_hook
-            .lock()
-            .unhook_function_with_closure(self.index)
-            .unwrap();
+impl fmt::Debug for HookFunction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HookFunction")
+            .field("hook_id", &self.hook_id)
+            .finish()
     }
+}
+
+impl HookRecord {
+    fn info(&self, hook_id: HookId) -> HookInfo {
+        HookInfo {
+            hook_id,
+            instance: self.instance.0 as usize,
+            slot: self.slot,
+            name: self.name.clone(),
+            diagnostics: self.context.diagnostics(),
+        }
+    }
+}
+
+/// Restores an instance's original vptr if scan still owns the latest vptr.
+///
+/// # Safety
+/// The object must still be live and host calls must be quiescent for restoration.
+pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
+    let key = Instance(instance.cast());
+    let registry = registry().lock();
+    let state = registry
+        .instances
+        .get(&key)
+        .ok_or(HookError::InvalidPointer("instance is not managed".into()))?;
+    let mut state = state.lock();
+    for id in state.slots.values() {
+        if let Some(record) = registry.by_id.get(id) {
+            record.context.set_enabled(false);
+        }
+    }
+    let expected = state.latest_table();
+    state.compare_exchange_vptr(expected, state.original_table)?;
+    state.restored = true;
+    // DEFERRED(vmthook): generations, trampolines, and contexts are never
+    // reclaimed because callers may still be executing through an old vptr.
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::bail;
     use memory::MemoryRegion;
 
     struct TableMap {
@@ -469,7 +659,7 @@ mod tests {
         let entries = [1usize as *const (), 2usize as *const (), ptr::null()];
         let map = map_for(&entries, entries.len());
 
-        let count = unsafe { HookInstance::count_funcs(entries.as_ptr(), 8, &map) }.unwrap();
+        let count = unsafe { InstanceState::count_funcs(entries.as_ptr(), 8, &map) }.unwrap();
 
         assert_eq!(count, 2);
     }
@@ -479,7 +669,7 @@ mod tests {
         let entries = [1usize as *const (), 2usize as *const ()];
         let map = map_for(&entries, entries.len());
 
-        let error = unsafe { HookInstance::count_funcs(entries.as_ptr(), 2, &map) }.unwrap_err();
+        let error = unsafe { InstanceState::count_funcs(entries.as_ptr(), 2, &map) }.unwrap_err();
 
         assert!(error.to_string().contains("2-slot limit"));
     }
@@ -489,7 +679,7 @@ mod tests {
         let entries = [1usize as *const (), 2usize as *const (), ptr::null()];
         let map = map_for(&entries, 2);
 
-        let error = unsafe { HookInstance::count_funcs(entries.as_ptr(), 3, &map) }.unwrap_err();
+        let error = unsafe { InstanceState::count_funcs(entries.as_ptr(), 3, &map) }.unwrap_err();
 
         assert!(error.to_string().contains("mapping boundary"));
     }
@@ -554,12 +744,10 @@ mod tests {
         let clone = unsafe { clone_layout(&layout, 1, VtableAbi::Msvc64) };
         let mut object_vptr = layout.as_ptr().wrapping_add(1);
 
-        unsafe {
-            HookInstance::replace_table_pointer(
-                (&mut object_vptr as *mut *const *const ()).cast(),
-                clone.address_point(),
-            );
-        }
+        let cell = unsafe {
+            &*((&mut object_vptr as *mut *const *const ()).cast::<AtomicPtr<*const ()>>())
+        };
+        cell.store(clone.address_point().cast_mut(), Ordering::Release);
 
         assert_eq!(object_vptr, clone.address_point());
         assert_eq!(unsafe { *object_vptr }, layout[1]);
