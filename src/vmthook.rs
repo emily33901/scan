@@ -929,8 +929,8 @@ mod tests {
             },
         };
 
-        let error = unsafe { InstanceState::get_table((&object_vptr as *const _).cast(), &map) }
-            .unwrap_err();
+        let object = (&object_vptr as *const *const *const ()).cast::<()>();
+        let error = unsafe { InstanceState::get_table(object, &map) }.unwrap_err();
         assert_eq!(error, HookError::UnwritableObject { address });
     }
 
