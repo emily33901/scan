@@ -92,6 +92,7 @@ pub enum HookError {
         instance: usize,
     },
     HookNotFound(HookId),
+    HookIdExhausted,
     UnsupportedTarget,
     JitInitialization(String),
     JitCompilation(String),
@@ -154,6 +155,7 @@ impl fmt::Display for HookError {
                 write!(f, "instance {instance:#x} is not managed")
             }
             Self::HookNotFound(id) => write!(f, "hook {} was not found", id.0),
+            Self::HookIdExhausted => f.write_str("process hook identifier space is exhausted"),
             Self::UnsupportedTarget => f.write_str("vtable hooking is unsupported on this target"),
             Self::JitInitialization(message) => {
                 write!(f, "failed to initialize trampoline JIT: {message}")
@@ -180,8 +182,13 @@ fn map_trampoline_error(error: TrampolineError) -> HookError {
 pub struct HookId(u64);
 
 impl HookId {
-    fn next() -> Self {
-        Self(NEXT_HOOK_ID.fetch_add(1, Ordering::Relaxed))
+    fn next() -> HookResult<Self> {
+        NEXT_HOOK_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map(Self)
+            .map_err(|_| HookError::HookIdExhausted)
     }
 }
 
@@ -652,7 +659,7 @@ impl HookFunction {
         })?;
         // Complete every fallible table read before emitting unreachable JIT code.
         let mut generation = state.next_generation()?;
-        let hook_id = HookId::next();
+        let hook_id = HookId::next()?;
         let context: Arc<dyn DispatchControl> =
             Arc::from(unsafe { f.into_dispatch(original, hook_id) });
         let trampoline = TrampolineStorage::global()

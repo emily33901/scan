@@ -396,7 +396,9 @@ impl TrampolineStorage {
 // panic semantics that cannot accidentally invoke the original twice.
 // DEFERRED(vmthook): add allow/blocking reentrancy policies after removing `&TThis`.
 // DEFERRED(vmthook): foreign exceptions and native faults are not contained here.
-// DEFERRED(vmthook): reject aggregate, vector, variadic, and hidden-sret ABIs explicitly.
+// DEFERRED(vmthook): support aggregate, vector, variadic, hidden-sret, unusual
+// calling-convention, and unmodelled `this`-adjustment ABIs only after each has
+// an explicit representation and native conformance tests.
 
 pub trait AsCraneliftAbi: sealed::Abi {
     fn as_cranelift_abi() -> AbiParam;
