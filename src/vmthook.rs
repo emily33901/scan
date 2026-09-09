@@ -237,14 +237,14 @@ pub struct HookDiagnostics {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VtableAbi {
-    #[cfg(any(target_os = "windows", test))]
+    #[cfg(any(all(target_os = "windows", target_env = "msvc"), test))]
     Msvc64,
     #[cfg(any(target_os = "macos", test))]
     Itanium64,
 }
 
 impl VtableAbi {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]
     fn current() -> HookResult<Self> {
         Ok(Self::Msvc64)
     }
@@ -259,19 +259,21 @@ impl VtableAbi {
     }
 
     #[cfg(not(any(
-        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"),
         all(
             target_os = "macos",
             any(target_arch = "x86_64", target_arch = "aarch64")
         )
     )))]
     fn current() -> HookResult<Self> {
+        // DEFERRED(vmthook): add MinGW/other target ABIs only after defining and
+        // testing their vtable prefixes and method calling conventions.
         Err(HookError::UnsupportedTarget)
     }
 
     const fn prefix_entries(self) -> usize {
         match self {
-            #[cfg(any(target_os = "windows", test))]
+            #[cfg(any(all(target_os = "windows", target_env = "msvc"), test))]
             Self::Msvc64 => 1,
             #[cfg(any(target_os = "macos", test))]
             Self::Itanium64 => 2,
@@ -585,10 +587,13 @@ impl HookFunction {
     /// `instance` must identify a live object with a compatible C++ vtable and
     /// remain alive while hooked. The original module must remain loaded. The
     /// callback's shared reference assumes foreign code does not mutate the object
-    /// incompatibly while it runs.
+    /// incompatibly while it runs. On Itanium targets, the class must not require
+    /// vcall or vbase offsets before the copied offset-to-top and typeinfo words.
     ///
     /// DEFERRED(vmthook): replace `&T` with an honest raw-pointer API before
     /// permitting concurrent or reentrant handlers.
+    /// DEFERRED(vmthook): support extended Itanium negative vtable entries after
+    /// introducing a validated, caller-supplied prefix extent.
     pub unsafe fn new_pre<R: 'static, T: 'static, Args: 'static>(
         instance: *mut T,
         index: usize,
