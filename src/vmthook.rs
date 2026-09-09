@@ -1039,6 +1039,18 @@ mod tests {
         }))
     }
 
+    fn leak_target_with_nonexecutable_second_slot() -> *mut HookTarget {
+        let prefix = VtableAbi::current().unwrap().prefix_entries();
+        let mut layout = vec![ptr::null(); prefix];
+        layout.extend([original_zero as *const (), 1usize as *const (), ptr::null()]);
+        let layout = Box::leak(layout.into_boxed_slice());
+        let vptr = unsafe { layout.as_ptr().add(prefix) };
+        Box::into_raw(Box::new(HookTarget {
+            vptr,
+            calls: AtomicU32::new(0),
+        }))
+    }
+
     unsafe fn call_slot(target: *mut HookTarget, slot: usize, value: u32) -> u32 {
         let function: unsafe extern "C" fn(*mut HookTarget, u32) -> u32 =
             unsafe { std::mem::transmute(*(*target).vptr.add(slot)) };
@@ -1083,6 +1095,21 @@ mod tests {
         assert!(
             matches!(error, HookError::DuplicateHook { slot: 0, existing, .. } if existing == _hook.id())
         );
+    }
+
+    #[test]
+    fn validates_every_original_entry_is_executable() {
+        let target = leak_target_with_nonexecutable_second_slot();
+        let error =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            HookError::NonExecutableOriginal {
+                slot: 1,
+                address: 1
+            }
+        ));
     }
 
     #[test]
