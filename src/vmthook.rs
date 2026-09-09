@@ -469,15 +469,14 @@ impl HookFunction {
             });
         }
 
-        let instance_state = match registry.instances.get(&instance_key) {
-            Some(state) => Arc::clone(state),
+        let (instance_state, new_instance) = match registry.instances.get(&instance_key) {
+            Some(state) => (Arc::clone(state), false),
             None => {
                 let state = Arc::new(Mutex::new(InstanceState::new(
                     instance.cast(),
                     options.max_vtable_slots,
                 )?));
-                registry.instances.insert(instance_key, Arc::clone(&state));
-                state
+                (state, true)
             }
         };
         let mut state = instance_state.lock();
@@ -511,7 +510,13 @@ impl HookFunction {
         state.compare_exchange_vptr(expected, replacement)?;
         state.generations.push(generation);
         state.slots.insert(index, hook_id);
+        drop(state);
 
+        if new_instance {
+            registry
+                .instances
+                .insert(instance_key, Arc::clone(&instance_state));
+        }
         registry.by_slot.insert((instance_key, index), hook_id);
         registry.by_id.insert(
             hook_id,
@@ -886,6 +891,23 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn failed_first_install_leaves_no_managed_instance() {
+        let target = leak_target();
+        let original = unsafe { (*target).vptr };
+        let error =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 2, |_: &HookTarget, _: u32| {}) }
+                .unwrap_err();
+
+        assert!(matches!(error, HookError::SlotOutOfRange { .. }));
+        assert_eq!(unsafe { (*target).vptr }, original);
+        assert!(HookFunction::list_for_instance(target).is_empty());
+        assert!(matches!(
+            unsafe { restore_instance(target) },
+            Err(HookError::InvalidPointer(_))
+        ));
     }
 
     #[test]
