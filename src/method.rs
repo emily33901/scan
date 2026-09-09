@@ -14,20 +14,36 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(target_arch = "aarch64", test))]
+mod aarch64;
+
 pub type CustomActionFn<'a> = Box<dyn Fn(usize) -> Result<usize> + 'a>;
 pub type CustomActions<'a> = HashMap<String, CustomActionFn<'a>>;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "action")]
 pub enum Action {
-    Add { offset: isize },
-    ResolveRelative { offset: usize },
+    Add {
+        offset: isize,
+    },
+    ResolveRelative {
+        offset: usize,
+    },
     Dereference {},
-    ResolvePageAndOffsetAddress { offset: usize },
+    ResolvePageAndOffsetAddress {
+        offset: usize,
+    },
     ImmediateFromInstructionAtAddress {},
     ResolveImmediateRelativeAddress {},
     ResolvePageOffsetRelativeAddress {},
-    Custom { name: String },
+    /// Follows an encoded direct branch or call at the current address.
+    ///
+    /// This is deliberately separate from `ResolveRelative`: callers do not
+    /// need to hard-code the displacement field's offset or width.
+    FollowDirectBranch {},
+    Custom {
+        name: String,
+    },
 }
 
 pub fn execute_plan(
@@ -48,11 +64,17 @@ pub fn execute_plan(
                 address = x86_64::resolve_relative_address(address, offset);
             }
             #[cfg(target_arch = "x86_64")]
+            &Action::FollowDirectBranch {} => {
+                address = x86_64::follow_direct_branch_at_address(address)?;
+            }
+            #[cfg(target_arch = "x86_64")]
             &Action::Dereference {} => address = unsafe { *(address as *const *const ()) as usize },
 
             #[cfg(target_arch = "aarch64")]
             &Action::ResolvePageAndOffsetAddress { offset } => {
-                address = macos::aarch64::resolve_page_and_offset_load_at_address(address)?;
+                address = macos::aarch64::resolve_page_and_offset_load_at_address_with_offset(
+                    address, offset,
+                )?;
             }
             #[cfg(target_arch = "aarch64")]
             &Action::ImmediateFromInstructionAtAddress {} => {
@@ -69,6 +91,10 @@ pub fn execute_plan(
             #[cfg(target_arch = "aarch64")]
             &Action::ResolvePageOffsetRelativeAddress {} => {
                 address = macos::aarch64::resolve_page_and_offset_load_at_address(address)?;
+            }
+            #[cfg(target_arch = "aarch64")]
+            &Action::FollowDirectBranch {} => {
+                address = macos::aarch64::follow_direct_branch_at_address(address)?;
             }
 
             Action::Custom { name } => {

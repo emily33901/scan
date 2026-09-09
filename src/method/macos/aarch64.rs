@@ -13,7 +13,8 @@ pub(crate) fn get_immediate(op: Operation) -> Result<isize> {
             let imm12 = bitfield.imm12();
             Ok((((imm12 as isize) << 52) >> 52) * 8)
         }
-        Operation::BRANCH_IMM(BRANCH_IMM::BL_ADDR_PCREL26(bitfield)) => {
+        Operation::BRANCH_IMM(BRANCH_IMM::B_ADDR_PCREL26(bitfield))
+        | Operation::BRANCH_IMM(BRANCH_IMM::BL_ADDR_PCREL26(bitfield)) => {
             let imm26 = bitfield.imm26();
             Ok((((imm26 as isize) << 38) >> 38) * 4)
         }
@@ -46,18 +47,40 @@ pub(crate) fn resolve_relative_address(address: usize, offset: isize) -> usize {
 
 pub(crate) fn resolve_page_aligned_relative_address(address: usize, offset: isize) -> usize {
     // https://developer.arm.com/documentation/ddi0602/2024-03/Base-Instructions/ADRP--Form-PC-relative-address-to-4KB-page-?lang=en
-    ((address + 4) & !0xfff)
-        .checked_add_signed(offset << 12)
-        .unwrap()
+    crate::method::aarch64::page_aligned_relative_target(address, offset)
+        .expect("ADRP target address overflow")
 }
 
 pub fn resolve_page_and_offset_load_at_address(address: usize) -> Result<usize> {
+    resolve_page_and_offset_load_at_address_with_offset(address, 0)
+}
+
+/// Resolves an ADRP plus following ADD/LDR pair beginning at `address + offset`.
+///
+/// `ResolvePageAndOffsetAddress { offset }` uses this form so the plan offset is
+/// part of the action's semantics rather than being silently ignored.
+pub fn resolve_page_and_offset_load_at_address_with_offset(
+    address: usize,
+    offset: usize,
+) -> Result<usize> {
+    let instruction_address = address
+        .checked_add(offset)
+        .ok_or_else(|| anyhow!("page-offset instruction address overflow"))?;
     let page = resolve_page_aligned_relative_address(
-        address,
-        immediate_from_instruction_at_address(address).context("page")?,
+        instruction_address,
+        immediate_from_instruction_at_address(instruction_address).context("page")?,
     );
 
-    let offset = immediate_from_instruction_at_address(address + 4).context("offset")?;
+    let next_instruction = instruction_address
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("page-offset next instruction address overflow"))?;
+    let offset = immediate_from_instruction_at_address(next_instruction).context("offset")?;
 
-    Ok(page.checked_add_signed(offset).unwrap())
+    page.checked_add_signed(offset)
+        .ok_or_else(|| anyhow!("page-offset target address overflow"))
+}
+
+pub(crate) fn follow_direct_branch_at_address(address: usize) -> Result<usize> {
+    let raw_instruction = unsafe { *(address as *const u32) };
+    crate::method::aarch64::direct_branch_target(address, raw_instruction)
 }
