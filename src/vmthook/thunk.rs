@@ -422,10 +422,21 @@ cranelift_abi!(usize, I32);
 cranelift_abi!(isize, I32);
 cranelift_abi!(u32, I32);
 cranelift_abi!(i32, I32);
-cranelift_abi!(u16, I16);
-cranelift_abi!(i16, I16);
-cranelift_abi!(u8, I8);
-cranelift_abi!(i8, I8);
+macro_rules! narrow_cranelift_abi {
+    ($t:ty, $abi:ident, $extension:ident) => {
+        impl AsCraneliftAbi for $t {
+            fn as_cranelift_abi() -> AbiParam {
+                AbiParam::new(types::$abi).$extension()
+            }
+        }
+        impl sealed::Abi for $t {}
+    };
+}
+
+narrow_cranelift_abi!(u16, I16, uext);
+narrow_cranelift_abi!(i16, I16, sext);
+narrow_cranelift_abi!(u8, I8, uext);
+narrow_cranelift_abi!(i8, I8, sext);
 
 #[cfg(test)]
 mod tests {
@@ -629,5 +640,30 @@ mod tests {
         let counter = AtomicU64::new(u64::MAX);
         increment_saturated(&counter);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn jit_preserves_narrow_signed_arguments_and_returns() {
+        struct NarrowTarget;
+        unsafe extern "C" fn narrow_original(_: *mut NarrowTarget, value: i8) -> i8 {
+            value.wrapping_sub(1)
+        }
+        let handler = |_: &NarrowTarget, _: i8| {};
+        let context: Box<dyn DispatchControl> = unsafe {
+            <_ as ThunkablePreHook<i8, NarrowTarget, (i8,)>>::into_dispatch(
+                handler,
+                narrow_original as *const (),
+                HookId(16),
+            )
+        };
+        let trampoline = TrampolineStorage::global()
+            .unwrap()
+            .make_trampoline(&*context, HookId(16))
+            .unwrap();
+        let function: unsafe extern "C" fn(*mut NarrowTarget, i8) -> i8 =
+            unsafe { std::mem::transmute(trampoline) };
+        let mut target = NarrowTarget;
+
+        assert_eq!(unsafe { function(&mut target, -100) }, -101);
     }
 }
