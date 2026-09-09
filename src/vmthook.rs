@@ -230,7 +230,9 @@ pub struct HookDiagnostics {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VtableAbi {
+    #[cfg(any(target_os = "windows", test))]
     Msvc64,
+    #[cfg(any(target_os = "macos", test))]
     Itanium64,
 }
 
@@ -262,7 +264,9 @@ impl VtableAbi {
 
     const fn prefix_entries(self) -> usize {
         match self {
+            #[cfg(any(target_os = "windows", test))]
             Self::Msvc64 => 1,
+            #[cfg(any(target_os = "macos", test))]
             Self::Itanium64 => 2,
         }
     }
@@ -508,7 +512,7 @@ fn validate_pointer(address: usize, description: &'static str) -> HookResult<()>
     if address == 0 {
         return Err(HookError::NullPointer { what: description });
     }
-    if address % align_of::<*const ()>() != 0 {
+    if !address.is_multiple_of(align_of::<*const ()>()) {
         return Err(HookError::MisalignedPointer {
             what: description,
             address,
@@ -812,9 +816,7 @@ pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
         }
     }
     let expected = state.latest_table();
-    if let Err(error) = state.compare_exchange_vptr(expected, state.original_table) {
-        return Err(error);
-    }
+    state.compare_exchange_vptr(expected, state.original_table)?;
     for id in state.slots.values() {
         if let Some(record) = registry.by_id.get(id) {
             record.context.retire(HookStatus::Restored);
@@ -873,7 +875,11 @@ mod tests {
 
     #[test]
     fn discovers_null_terminated_table() {
-        let entries = [1usize as *const (), 2usize as *const (), ptr::null()];
+        let entries = [
+            ptr::without_provenance(1),
+            ptr::without_provenance(2),
+            ptr::null(),
+        ];
         let map = map_for(&entries, entries.len());
 
         let count = unsafe { InstanceState::count_funcs(entries.as_ptr(), 8, &map) }.unwrap();
@@ -883,7 +889,7 @@ mod tests {
 
     #[test]
     fn rejects_table_without_terminator_before_cap() {
-        let entries = [1usize as *const (), 2usize as *const ()];
+        let entries = [ptr::without_provenance(1), ptr::without_provenance(2)];
         let map = map_for(&entries, entries.len());
 
         let error = unsafe { InstanceState::count_funcs(entries.as_ptr(), 2, &map) }.unwrap_err();
@@ -893,7 +899,11 @@ mod tests {
 
     #[test]
     fn rejects_mapping_boundary_before_terminator() {
-        let entries = [1usize as *const (), 2usize as *const (), ptr::null()];
+        let entries = [
+            ptr::without_provenance(1),
+            ptr::without_provenance(2),
+            ptr::null(),
+        ];
         let map = map_for(&entries, 2);
 
         let error = unsafe { InstanceState::count_funcs(entries.as_ptr(), 3, &map) }.unwrap_err();
@@ -1051,7 +1061,11 @@ mod tests {
     fn leak_target_with_nonexecutable_second_slot() -> *mut HookTarget {
         let prefix = VtableAbi::current().unwrap().prefix_entries();
         let mut layout = vec![ptr::null(); prefix];
-        layout.extend([original_zero as *const (), 1usize as *const (), ptr::null()]);
+        layout.extend([
+            original_zero as *const (),
+            ptr::without_provenance(1),
+            ptr::null(),
+        ]);
         let layout = Box::leak(layout.into_boxed_slice());
         let vptr = unsafe { layout.as_ptr().add(prefix) };
         Box::into_raw(Box::new(HookTarget {

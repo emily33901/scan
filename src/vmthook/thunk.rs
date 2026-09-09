@@ -58,9 +58,14 @@ where
 }
 
 fn increment_saturated(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        value.checked_add(1)
-    });
+    // Diagnostics are deliberately best-effort: dispatch must never spin under
+    // contention merely to update a counter. A lost sample is preferable to an
+    // unbounded retry on the host's real-time thread.
+    let value = counter.load(Ordering::Relaxed);
+    if value != u64::MAX {
+        let _ =
+            counter.compare_exchange_weak(value, value + 1, Ordering::Relaxed, Ordering::Relaxed);
+    }
 }
 
 struct BusyGuard<'a>(&'a AtomicBool);
