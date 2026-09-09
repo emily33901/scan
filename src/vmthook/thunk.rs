@@ -483,6 +483,7 @@ mod tests {
     use super::*;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
+    use std::ptr;
     use std::sync::{
         atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc, Barrier,
@@ -811,5 +812,132 @@ mod tests {
         let mut target = NarrowTarget;
 
         assert_eq!(unsafe { function(&mut target, -100) }, -101);
+    }
+
+    #[test]
+    fn jit_round_trips_advertised_scalar_and_pointer_types() {
+        struct AbiTarget;
+
+        macro_rules! assert_round_trip {
+            ($id:expr, $type:ty, $value:expr) => {{
+                unsafe extern "C" fn original(_: *mut AbiTarget, value: $type) -> $type {
+                    value
+                }
+                let handler = |_: &AbiTarget, _: $type| {};
+                let context: Box<dyn DispatchControl> = unsafe {
+                    <_ as ThunkablePreHook<$type, AbiTarget, ($type,)>>::into_dispatch(
+                        handler,
+                        original as *const (),
+                        HookId($id),
+                    )
+                };
+                let trampoline = TrampolineStorage::global()
+                    .unwrap()
+                    .make_trampoline(&*context, HookId($id))
+                    .unwrap();
+                let function: unsafe extern "C" fn(*mut AbiTarget, $type) -> $type =
+                    unsafe { std::mem::transmute(trampoline) };
+                let mut target = AbiTarget;
+                assert_eq!(unsafe { function(&mut target, $value) }, $value);
+            }};
+        }
+
+        assert_round_trip!(100, u8, 201);
+        assert_round_trip!(101, i8, -101);
+        assert_round_trip!(102, u16, 50_001);
+        assert_round_trip!(103, i16, -20_001);
+        assert_round_trip!(104, u32, 3_000_000_001);
+        assert_round_trip!(105, i32, -2_000_000_001);
+        assert_round_trip!(106, usize, usize::MAX / 3);
+        assert_round_trip!(107, isize, isize::MIN / 3);
+        assert_round_trip!(108, f32, -123.25);
+        assert_round_trip!(109, f64, 987_654.125);
+        assert_round_trip!(110, *const u8, ptr::without_provenance(0x1234));
+        assert_round_trip!(111, *mut u8, ptr::without_provenance_mut(0x5678));
+    }
+
+    #[test]
+    fn jit_round_trips_zero_and_five_argument_arities() {
+        struct AbiTarget {
+            observed: AtomicUsize,
+        }
+
+        unsafe extern "C" fn zero_original(_: *mut AbiTarget) -> isize {
+            -77
+        }
+        let zero_handler = |_: &AbiTarget| {};
+        let zero_context: Box<dyn DispatchControl> = unsafe {
+            <_ as ThunkablePreHook<isize, AbiTarget, ()>>::into_dispatch(
+                zero_handler,
+                zero_original as *const (),
+                HookId(112),
+            )
+        };
+        let zero_trampoline = TrampolineStorage::global()
+            .unwrap()
+            .make_trampoline(&*zero_context, HookId(112))
+            .unwrap();
+        let zero_function: unsafe extern "C" fn(*mut AbiTarget) -> isize =
+            unsafe { std::mem::transmute(zero_trampoline) };
+        let mut target = AbiTarget {
+            observed: AtomicUsize::new(0),
+        };
+        assert_eq!(unsafe { zero_function(&mut target) }, -77);
+
+        unsafe extern "C" fn mixed_original(
+            _: *mut AbiTarget,
+            small: u8,
+            signed: i16,
+            wide: usize,
+            float: f32,
+            pointer: *const u8,
+        ) -> usize {
+            small as usize
+                + signed.unsigned_abs() as usize
+                + wide
+                + float as usize
+                + pointer as usize
+        }
+        let mixed_handler = |this: &AbiTarget,
+                             small: u8,
+                             signed: i16,
+                             wide: usize,
+                             float: f32,
+                             pointer: *const u8| {
+            this.observed.store(
+                small as usize
+                    + signed.unsigned_abs() as usize
+                    + wide
+                    + float as usize
+                    + pointer as usize,
+                Ordering::Relaxed,
+            );
+        };
+        let mixed_context: Box<dyn DispatchControl> = unsafe {
+            <_ as ThunkablePreHook<
+                usize,
+                AbiTarget,
+                (u8, i16, usize, f32, *const u8),
+            >>::into_dispatch(
+                mixed_handler,
+                mixed_original as *const (),
+                HookId(113),
+            )
+        };
+        let mixed_trampoline = TrampolineStorage::global()
+            .unwrap()
+            .make_trampoline(&*mixed_context, HookId(113))
+            .unwrap();
+        type MixedFunction =
+            unsafe extern "C" fn(*mut AbiTarget, u8, i16, usize, f32, *const u8) -> usize;
+        let mixed_function: MixedFunction = unsafe { std::mem::transmute(mixed_trampoline) };
+        let pointer = ptr::without_provenance(0x9000);
+        let expected = 7 + 13 + 29 + 3 + pointer as usize;
+
+        assert_eq!(
+            unsafe { mixed_function(&mut target, 7, -13, 29, 3.5, pointer) },
+            expected
+        );
+        assert_eq!(target.observed.load(Ordering::Relaxed), expected);
     }
 }
