@@ -161,6 +161,8 @@ impl MemoryMap for ProcessMemoryMap {
     fn region_containing(&self, requested: usize) -> Result<MemoryRegion> {
         use mach2::{
             kern_return::KERN_SUCCESS,
+            mach_port::mach_port_deallocate,
+            port::MACH_PORT_NULL,
             traps::mach_task_self,
             vm::mach_vm_region,
             vm_prot::{VM_PROT_EXECUTE, VM_PROT_READ},
@@ -184,6 +186,11 @@ impl MemoryMap for ProcessMemoryMap {
                 &mut object_name,
             )
         };
+        if result == KERN_SUCCESS && object_name != MACH_PORT_NULL {
+            // `mach_vm_region` returns a send right for the backing object.
+            // Region inspection does not retain it.
+            unsafe { mach_port_deallocate(mach_task_self(), object_name) };
+        }
         if result != KERN_SUCCESS {
             bail!("mach_vm_region failed for address {requested:#x}: {result}");
         }
