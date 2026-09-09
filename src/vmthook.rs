@@ -15,7 +15,8 @@ use std::{
 
 use anyhow::Result;
 use memory::{
-    checked_pointer_address, ensure_executable, ensure_readable, MemoryMap, ProcessMemoryMap,
+    checked_pointer_address, ensure_executable, ensure_readable, ensure_writable, MemoryMap,
+    ProcessMemoryMap,
 };
 use parking_lot::Mutex;
 use thunk::{DispatchControl, ThunkablePreHook, TrampolineStorage};
@@ -292,7 +293,10 @@ impl InstanceState {
         validate_pointer(instance as usize, "instance")?;
         ensure_readable(map, instance as usize, size_of::<*const *const ()>())
             .map_err(|error| HookError::InvalidPointer(error.to_string()))?;
-        let table = unsafe { ptr::read(instance as *const *const *const ()) };
+        ensure_writable(map, instance as usize, size_of::<*const *const ()>())
+            .map_err(|error| HookError::InvalidPointer(error.to_string()))?;
+        let cell = unsafe { &*(instance as *const AtomicPtr<*const ()>) };
+        let table = cell.load(Ordering::Acquire).cast_const();
         validate_pointer(table as usize, "vtable")?;
         Ok(table)
     }
@@ -717,6 +721,7 @@ mod tests {
                 start,
                 end: start + mapped_entries * size_of::<*const ()>(),
                 readable: true,
+                writable: true,
                 executable: false,
             },
         }

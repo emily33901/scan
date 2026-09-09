@@ -6,6 +6,7 @@ pub(crate) struct MemoryRegion {
     pub(crate) start: usize,
     pub(crate) end: usize,
     pub(crate) readable: bool,
+    pub(crate) writable: bool,
     pub(crate) executable: bool,
 }
 
@@ -33,6 +34,14 @@ pub(crate) fn ensure_readable<M: MemoryMap>(map: &M, address: usize, size: usize
     let region = map.region_containing(address)?;
     if !region.readable || !region.contains(address, size) {
         bail!("memory range {address:#x}..+{size} is not readable");
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_writable<M: MemoryMap>(map: &M, address: usize, size: usize) -> Result<()> {
+    let region = map.region_containing(address)?;
+    if !region.writable || !region.contains(address, size) {
+        bail!("memory range {address:#x}..+{size} is not writable");
     }
     Ok(())
 }
@@ -99,11 +108,21 @@ impl MemoryMap for ProcessMemoryMap {
             ]
             .iter()
             .any(|flag| protection.contains(*flag));
+        let writable = accessible
+            && [
+                PAGE_READWRITE,
+                PAGE_WRITECOPY,
+                PAGE_EXECUTE_READWRITE,
+                PAGE_EXECUTE_WRITECOPY,
+            ]
+            .iter()
+            .any(|flag| protection.contains(*flag));
 
         Ok(MemoryRegion {
             start,
             end,
             readable,
+            writable,
             executable,
         })
     }
@@ -131,6 +150,7 @@ mod tests {
             start: 0x1000,
             end: 0x1008,
             readable: true,
+            writable: false,
             executable: false,
         });
 
@@ -149,6 +169,7 @@ mod tests {
             start: 0x1000,
             end: 0x2000,
             readable: true,
+            writable: false,
             executable: false,
         });
 
@@ -165,7 +186,7 @@ impl MemoryMap for ProcessMemoryMap {
             port::MACH_PORT_NULL,
             traps::mach_task_self,
             vm::mach_vm_region,
-            vm_prot::{VM_PROT_EXECUTE, VM_PROT_READ},
+            vm_prot::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE},
             vm_region::{vm_region_basic_info_64, vm_region_info_t, VM_REGION_BASIC_INFO_64},
         };
         use std::mem::zeroed;
@@ -209,6 +230,7 @@ impl MemoryMap for ProcessMemoryMap {
             start,
             end,
             readable: info.protection & VM_PROT_READ != 0,
+            writable: info.protection & VM_PROT_WRITE != 0,
             executable: info.protection & VM_PROT_EXECUTE != 0,
         })
     }
