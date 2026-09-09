@@ -1075,8 +1075,17 @@ mod tests {
     }
 
     unsafe fn call_slot(target: *mut HookTarget, slot: usize, value: u32) -> u32 {
+        unsafe { call_table_slot(target, (*target).vptr, slot, value) }
+    }
+
+    unsafe fn call_table_slot(
+        target: *mut HookTarget,
+        table: *const *const (),
+        slot: usize,
+        value: u32,
+    ) -> u32 {
         let function: unsafe extern "C" fn(*mut HookTarget, u32) -> u32 =
-            unsafe { std::mem::transmute(*(*target).vptr.add(slot)) };
+            unsafe { std::mem::transmute(*table.add(slot)) };
         unsafe { function(target, value) }
     }
 
@@ -1098,6 +1107,8 @@ mod tests {
         assert_ne!(unsafe { *second_vptr.add(1) }, original_slot_one);
         assert_eq!(unsafe { call_slot(target, 0, 1) }, 11);
         assert_eq!(unsafe { call_slot(target, 1, 2) }, 22);
+        assert_eq!(unsafe { call_table_slot(target, first_vptr, 0, 3) }, 13);
+        assert_eq!(unsafe { call_table_slot(target, first_vptr, 1, 4) }, 24);
         assert_eq!(HookFunction::list_for_instance(target).len(), 2);
         assert_eq!(HookFunction::lookup(first.id()).unwrap().slot, 0);
         assert_eq!(
@@ -1225,12 +1236,37 @@ mod tests {
             })
         }
         .unwrap();
-        assert!(HookFunction::set_enabled_by_id(hook.id(), false).unwrap());
-        assert_eq!(unsafe { call_slot(target, 0, 5) }, 15);
-        assert_eq!(unsafe { &*target }.calls.load(Ordering::Relaxed), 1);
-        assert!(HookFunction::set_enabled_by_id(hook.id(), true).unwrap());
-        assert_eq!(unsafe { call_slot(target, 0, 6) }, 16);
-        assert_eq!(unsafe { &*target }.calls.load(Ordering::Relaxed), 102);
+        for cycle in 0..3 {
+            assert!(HookFunction::set_enabled_by_id(hook.id(), false).unwrap());
+            assert_eq!(unsafe { call_slot(target, 0, cycle) }, cycle + 10);
+            assert!(HookFunction::set_enabled_by_id(hook.id(), true).unwrap());
+            assert_eq!(unsafe { call_slot(target, 0, cycle) }, cycle + 10);
+        }
+        assert_eq!(unsafe { &*target }.calls.load(Ordering::Relaxed), 306);
+    }
+
+    #[test]
+    fn publication_conflict_leaves_foreign_vptr_unchanged() {
+        let target = leak_target();
+        let original = unsafe { (*target).vptr };
+        let first =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
+                .unwrap();
+        let first_generation = unsafe { (*target).vptr };
+        unsafe { (*target).vptr = original };
+
+        let error =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 1, |_: &HookTarget, _: u32| {}) }
+                .unwrap_err();
+
+        assert!(matches!(error, HookError::VptrConflict { .. }));
+        assert_eq!(unsafe { (*target).vptr }, original);
+        assert_eq!(HookFunction::list_for_instance(target).len(), 1);
+        assert_eq!(
+            unsafe { call_table_slot(target, first_generation, 0, 7) },
+            17
+        );
+        assert_eq!(HookFunction::lookup(first.id()).unwrap().slot, 0);
     }
 
     #[test]
