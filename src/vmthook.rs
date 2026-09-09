@@ -17,6 +17,100 @@ use thunk::{ThunkableClosure, TrampolineStorage};
 
 const DEFAULT_MAX_VTABLE_SLOTS: usize = 4096;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VtableAbi {
+    Msvc64,
+    Itanium64,
+}
+
+impl VtableAbi {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn current() -> Result<Self> {
+        Ok(Self::Msvc64)
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn current() -> Result<Self> {
+        // DEFERRED(vmthook): arm64e pointer authentication needs validation in Ableton.
+        Ok(Self::Itanium64)
+    }
+
+    #[cfg(not(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    fn current() -> Result<Self> {
+        bail!("vtable hooking is unsupported on this target")
+    }
+
+    const fn prefix_entries(self) -> usize {
+        match self {
+            Self::Msvc64 => 1,
+            Self::Itanium64 => 2,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClonedVtable {
+    storage: Box<[*const ()]>,
+    prefix_entries: usize,
+}
+
+impl ClonedVtable {
+    unsafe fn copy_from<M: MemoryMap>(
+        original_table: *const *const (),
+        table_len: usize,
+        abi: VtableAbi,
+        map: &M,
+    ) -> Result<Self> {
+        let prefix_entries = abi.prefix_entries();
+        let mut entries = Vec::with_capacity(prefix_entries + table_len);
+        let pointer_size = size_of::<*const ()>();
+
+        for distance in (1..=prefix_entries).rev() {
+            let offset = distance
+                .checked_mul(pointer_size)
+                .ok_or_else(|| anyhow::anyhow!("vtable prefix address arithmetic overflow"))?;
+            let address = (original_table as usize)
+                .checked_sub(offset)
+                .ok_or_else(|| anyhow::anyhow!("vtable prefix address arithmetic overflow"))?;
+            ensure_readable(map, address, pointer_size)?;
+            entries.push(unsafe { ptr::read(address as *const *const ()) });
+        }
+
+        for index in 0..table_len {
+            let address = checked_pointer_address(original_table as usize, index)?;
+            ensure_readable(map, address, pointer_size)?;
+            entries.push(unsafe { ptr::read(address as *const *const ()) });
+        }
+
+        Ok(Self {
+            storage: entries.into_boxed_slice(),
+            prefix_entries,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.storage.len() - self.prefix_entries
+    }
+
+    fn address_point(&self) -> *const *const () {
+        // SAFETY: construction always reserves `prefix_entries` elements first.
+        unsafe { self.storage.as_ptr().add(self.prefix_entries) }
+    }
+
+    fn function_entry_mut(&mut self, index: usize) -> &mut *const () {
+        &mut self.storage[self.prefix_entries + index]
+    }
+}
+
 thread_local! {
     static GLOBAL_TRAMPOLINE_STORAGE: TrampolineStorage = TrampolineStorage::new().unwrap();
 }
@@ -31,7 +125,7 @@ unsafe impl Sync for Instance {}
 struct HookInstance {
     instance: *mut (),
     original_table: *const *const (),
-    new_table: Box<[*const ()]>,
+    new_table: ClonedVtable,
     // NOTE(emily): These are not actually 0 arg functions
     closures: HashMap<usize, *const dyn Fn()>,
 }
@@ -74,7 +168,7 @@ impl HookInstance {
         if !region.readable || !region.contains(base, size_of::<*const ()>()) {
             bail!("vtable does not begin in readable memory");
         }
-        // DELIBERATE DEFERRAL: exact C++ vtable lengths are ABI- and class-specific.
+        // DEFERRED(vmthook): exact C++ vtable lengths are ABI- and class-specific.
         // Keep the observed null-terminator heuristic, but constrain it to one mapping
         // and a hard slot cap so an unfamiliar table fails closed.
         for index in 0..max_slots {
@@ -113,15 +207,11 @@ impl HookInstance {
 
         let table_len =
             unsafe { Self::count_funcs(original_table, DEFAULT_MAX_VTABLE_SLOTS, &map)? };
-        let mut entries = Vec::with_capacity(table_len);
-        for index in 0..table_len {
-            let address = checked_pointer_address(original_table as usize, index)?;
-            // Discovery validated this whole range one entry at a time above.
-            entries.push(unsafe { ptr::read(address as *const *const ()) });
-        }
-        let new_table = entries.into_boxed_slice();
+        let new_table = unsafe {
+            ClonedVtable::copy_from(original_table, table_len, VtableAbi::current()?, &map)?
+        };
 
-        unsafe { Self::replace_table_pointer(instance, new_table.as_ptr()) };
+        unsafe { Self::replace_table_pointer(instance, new_table.address_point()) };
 
         Ok(Self {
             original_table,
@@ -143,13 +233,14 @@ impl HookInstance {
         ensure_range(index, self.new_table.len())?;
         let original = self.original_function(index);
         ensure_executable(&ProcessMemoryMap, original as usize)?;
-        self.new_table[index] = f;
+        *self.new_table.function_entry_mut(index) = f;
         Ok(())
     }
 
     pub fn unhook_function(&mut self, index: usize) -> Result<()> {
         ensure_range(index, self.new_table.len())?;
-        self.new_table[index] = unsafe { *self.original_table.wrapping_add(index) };
+        *self.new_table.function_entry_mut(index) =
+            unsafe { *self.original_table.wrapping_add(index) };
         Ok(())
     }
 
@@ -297,6 +388,17 @@ mod tests {
         }
     }
 
+    unsafe fn clone_layout(
+        layout: &[*const ()],
+        prefix_entries: usize,
+        abi: VtableAbi,
+    ) -> ClonedVtable {
+        let map = map_for(layout, layout.len());
+        let address_point = unsafe { layout.as_ptr().add(prefix_entries) };
+        let table_len = layout.len() - prefix_entries - 1;
+        unsafe { ClonedVtable::copy_from(address_point, table_len, abi, &map) }.unwrap()
+    }
+
     #[test]
     fn discovers_null_terminated_table() {
         let entries = [1usize as *const (), 2usize as *const (), ptr::null()];
@@ -338,5 +440,80 @@ mod tests {
     fn rejects_null_and_misaligned_pointers() {
         assert!(validate_pointer(0, "test").is_err());
         assert!(validate_pointer(1, "test").is_err());
+    }
+
+    #[test]
+    fn preserves_msvc_prefix_and_function_entries() {
+        let layout = [
+            0x101usize as *const (),
+            0x201usize as *const (),
+            0x301usize as *const (),
+            ptr::null(),
+        ];
+
+        let clone = unsafe { clone_layout(&layout, 1, VtableAbi::Msvc64) };
+
+        assert_eq!(&*clone.storage, &layout[..layout.len() - 1]);
+        assert_eq!(clone.address_point(), unsafe {
+            clone.storage.as_ptr().add(1)
+        });
+        assert_eq!(unsafe { *clone.address_point() }, layout[1]);
+    }
+
+    #[test]
+    fn preserves_itanium_prefix_and_function_entries() {
+        let layout = [
+            (-16isize) as *const (),
+            0x102usize as *const (),
+            0x202usize as *const (),
+            0x302usize as *const (),
+            ptr::null(),
+        ];
+
+        let clone = unsafe { clone_layout(&layout, 2, VtableAbi::Itanium64) };
+
+        assert_eq!(&*clone.storage, &layout[..layout.len() - 1]);
+        assert_eq!(clone.address_point(), unsafe {
+            clone.storage.as_ptr().add(2)
+        });
+        assert_eq!(unsafe { *clone.address_point() }, layout[2]);
+    }
+
+    #[test]
+    fn replacement_vptr_targets_function_entry_zero() {
+        let layout = [
+            0x103usize as *const (),
+            0x203usize as *const (),
+            ptr::null(),
+        ];
+        let clone = unsafe { clone_layout(&layout, 1, VtableAbi::Msvc64) };
+        let mut object_vptr = layout.as_ptr().wrapping_add(1);
+
+        unsafe {
+            HookInstance::replace_table_pointer(
+                (&mut object_vptr as *mut *const *const ()).cast(),
+                clone.address_point(),
+            );
+        }
+
+        assert_eq!(object_vptr, clone.address_point());
+        assert_eq!(unsafe { *object_vptr }, layout[1]);
+    }
+
+    #[test]
+    fn rejects_unreadable_vtable_prefix() {
+        let layout = [
+            0x104usize as *const (),
+            0x204usize as *const (),
+            ptr::null(),
+        ];
+        let function_entries = &layout[1..];
+        let map = map_for(function_entries, function_entries.len());
+
+        let error =
+            unsafe { ClonedVtable::copy_from(layout.as_ptr().add(1), 1, VtableAbi::Msvc64, &map) }
+                .unwrap_err();
+
+        assert!(error.to_string().contains("mapping"));
     }
 }
