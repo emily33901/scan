@@ -88,6 +88,9 @@ pub enum HookError {
         actual: usize,
     },
     InstanceRestored,
+    InstanceNotManaged {
+        instance: usize,
+    },
     HookNotFound(HookId),
     UnsupportedTarget,
     JitInitialization(String),
@@ -146,6 +149,9 @@ impl fmt::Display for HookError {
             ),
             Self::InstanceRestored => {
                 f.write_str("restored hook instances cannot currently be hooked again")
+            }
+            Self::InstanceNotManaged { instance } => {
+                write!(f, "instance {instance:#x} is not managed")
             }
             Self::HookNotFound(id) => write!(f, "hook {} was not found", id.0),
             Self::UnsupportedTarget => f.write_str("vtable hooking is unsupported on this target"),
@@ -790,9 +796,12 @@ impl HookRecord {
 pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
     let key = Instance(instance.cast());
     let registry = registry().lock();
-    let state = registry.instances.get(&key).ok_or(HookError::NullPointer {
-        what: "managed instance",
-    })?;
+    let state = registry
+        .instances
+        .get(&key)
+        .ok_or(HookError::InstanceNotManaged {
+            instance: instance as usize,
+        })?;
     let mut state = state.lock();
     if state.restored {
         return Err(HookError::InstanceRestored);
@@ -1158,9 +1167,7 @@ mod tests {
         assert!(HookFunction::list_for_instance(target).is_empty());
         assert!(matches!(
             unsafe { restore_instance(target) },
-            Err(HookError::NullPointer {
-                what: "managed instance"
-            })
+            Err(HookError::InstanceNotManaged { .. })
         ));
     }
 

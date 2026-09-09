@@ -86,6 +86,7 @@ impl DispatchState {
     const DISABLED: u8 = 1;
     const PANICKED: u8 = 2;
     const RETIRED: u8 = 3;
+    const RESTORED: u8 = 4;
 
     fn new(hook_id: HookId) -> Self {
         Self {
@@ -124,7 +125,11 @@ impl DispatchState {
         } else {
             loop {
                 let state = self.run_state.load(Ordering::Acquire);
-                if state == Self::PANICKED || state == Self::RETIRED || state == Self::DISABLED {
+                if state == Self::PANICKED
+                    || state == Self::RETIRED
+                    || state == Self::RESTORED
+                    || state == Self::DISABLED
+                {
                     return true;
                 }
                 if self
@@ -146,7 +151,7 @@ impl DispatchState {
     fn inactive_status(&self) -> HookStatus {
         match self.run_state.load(Ordering::Acquire) {
             Self::PANICKED => HookStatus::Panicked,
-            Self::RETIRED => HookStatus::Restored,
+            Self::RESTORED => HookStatus::Restored,
             _ => HookStatus::Disabled,
         }
     }
@@ -254,7 +259,12 @@ macro_rules! impl_func {
 
                 fn set_enabled(&self, enabled: bool) -> bool { self.state.set_enabled(enabled) }
                 fn retire(&self, status: HookStatus) {
-                    self.state.run_state.store(DispatchState::RETIRED, Ordering::Release);
+                    let run_state = if status == HookStatus::Restored {
+                        DispatchState::RESTORED
+                    } else {
+                        DispatchState::RETIRED
+                    };
+                    self.state.run_state.store(run_state, Ordering::Release);
                     self.state.last_status.store(status as u8, Ordering::Relaxed);
                 }
                 fn diagnostics(&self) -> HookDiagnostics { self.state.diagnostics() }
