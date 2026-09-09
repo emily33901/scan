@@ -481,10 +481,64 @@ narrow_cranelift_abi!(i8, I8, sext);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
     use std::sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc, Barrier,
     };
+
+    struct ThreadTrackingAllocator;
+
+    thread_local! {
+        static TRACK_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    unsafe impl GlobalAlloc for ThreadTrackingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            TRACK_ALLOCATIONS.with(|tracking| {
+                if tracking.get() {
+                    ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            TRACK_ALLOCATIONS.with(|tracking| {
+                if tracking.get() {
+                    ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            TRACK_ALLOCATIONS.with(|tracking| {
+                if tracking.get() {
+                    ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.realloc(pointer, layout, size) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: ThreadTrackingAllocator = ThreadTrackingAllocator;
+
+    fn allocations_during<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        TRACK_ALLOCATIONS.with(|tracking| tracking.set(true));
+        let result = operation();
+        TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
+        let allocations = ALLOCATION_COUNT.with(Cell::get);
+        (result, allocations)
+    }
 
     struct Target {
         original_calls: AtomicU32,
@@ -643,6 +697,58 @@ mod tests {
         assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
         assert_eq!(target.original_calls.load(Ordering::Relaxed), 2);
         assert_eq!(dispatch.diagnostics().bypasses, 1);
+    }
+
+    #[test]
+    fn nested_entry_bypasses_handler_and_calls_original() {
+        let context_address = Arc::new(AtomicUsize::new(0));
+        let dispatcher_address = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::new(AtomicU32::new(0));
+        let nested_result = Arc::new(AtomicU32::new(0));
+        let captured_context = Arc::clone(&context_address);
+        let captured_dispatcher = Arc::clone(&dispatcher_address);
+        let observed_calls = Arc::clone(&handler_calls);
+        let observed_result = Arc::clone(&nested_result);
+        let handler = move |this: &Target, _argument: u32| {
+            observed_calls.fetch_add(1, Ordering::Relaxed);
+            let dispatcher: TestDispatcher =
+                unsafe { std::mem::transmute(captured_dispatcher.load(Ordering::Relaxed)) };
+            let result = unsafe {
+                dispatcher(
+                    captured_context.load(Ordering::Relaxed) as *const (),
+                    this as *const Target as *mut Target,
+                    40,
+                )
+            };
+            observed_result.store(result, Ordering::Relaxed);
+        };
+        let dispatch = unsafe { make_dispatch(handler, 17) };
+        context_address.store(dispatch.context_address() as usize, Ordering::Relaxed);
+        dispatcher_address.store(dispatch.dispatcher_address() as usize, Ordering::Relaxed);
+        let mut target = Target {
+            original_calls: AtomicU32::new(0),
+        };
+
+        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 1) }, 2);
+        assert_eq!(nested_result.load(Ordering::Relaxed), 41);
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(target.original_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(dispatch.diagnostics().bypasses, 1);
+    }
+
+    #[test]
+    fn warmed_dispatch_makes_no_framework_allocations() {
+        let dispatch = unsafe { make_dispatch(|_: &Target, _: u32| {}, 18) };
+        let mut target = Target {
+            original_calls: AtomicU32::new(0),
+        };
+        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 0) }, 1);
+
+        let (result, allocations) =
+            allocations_during(|| unsafe { direct_dispatch(&*dispatch, &mut target, 41) });
+
+        assert_eq!(result, 42);
+        assert_eq!(allocations, 0);
     }
 
     fn counting_handler(counter: Arc<AtomicU32>) -> impl Fn(&Target, u32) {
