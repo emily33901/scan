@@ -93,3 +93,6 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn main() {}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn main() {}
