@@ -72,8 +72,8 @@ pub fn execute_plan(
 
             #[cfg(target_arch = "aarch64")]
             &Action::ResolvePageAndOffsetAddress { offset } => {
-                address = macos::aarch64::resolve_page_and_offset_load_at_address_with_offset(
-                    address, offset,
+                address = macos::aarch64::resolve_page_and_offset_load_at_address(
+                    aarch64::page_pair_instruction_address(address, offset),
                 )?;
             }
             #[cfg(target_arch = "aarch64")]

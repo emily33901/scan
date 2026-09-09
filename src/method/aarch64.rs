@@ -13,6 +13,14 @@ pub(crate) fn page_aligned_relative_target(
         .ok_or_else(|| anyhow!("ADRP target address overflow"))
 }
 
+/// Keeps the legacy scan-plan contract for page-pair resolution.
+///
+/// `ResolvePageAndOffsetAddress.offset` has always been serialized, but the
+/// runtime resolves the ADRP/ADD or ADRP/LDR pair at the current address.
+pub(crate) const fn page_pair_instruction_address(address: usize, _offset: usize) -> usize {
+    address
+}
+
 /// Resolves an ARM64 `B` or `BL` instruction from its encoded word.
 pub(crate) fn direct_branch_target(address: usize, instruction: u32) -> Result<usize> {
     match instruction & 0xfc00_0000 {
@@ -35,6 +43,11 @@ mod tests {
     fn adrp_uses_the_current_instruction_page() {
         assert_eq!(page_aligned_relative_target(0x1FFC, 1).unwrap(), 0x2000);
         assert_eq!(page_aligned_relative_target(0x2000, -1).unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn page_pair_actions_ignore_the_serialized_offset() {
+        assert_eq!(page_pair_instruction_address(0x1234, 4), 0x1234);
     }
 
     #[test]
