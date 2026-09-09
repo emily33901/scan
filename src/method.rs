@@ -118,3 +118,38 @@ pub fn execute_plan(
 
     Ok(address)
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+
+    use super::Action;
+
+    #[derive(Serialize, Deserialize)]
+    struct ScanSignature {
+        plan: Vec<Action>,
+    }
+
+    #[test]
+    fn follow_direct_branch_round_trips_through_toml_plan() {
+        let text = r#"
+[[plan]]
+action = "FollowDirectBranch"
+"#;
+        let signature: ScanSignature = toml::from_str(text).unwrap();
+        assert!(matches!(
+            signature.plan.as_slice(),
+            [Action::FollowDirectBranch {}]
+        ));
+
+        let serialized = toml::to_string(&signature).unwrap();
+        assert!(serialized.contains("[[plan]]"));
+        assert!(serialized.contains("action = \"FollowDirectBranch\""));
+
+        let round_trip: ScanSignature = toml::from_str(&serialized).unwrap();
+        assert!(matches!(
+            round_trip.plan.as_slice(),
+            [Action::FollowDirectBranch {}]
+        ));
+    }
+}
