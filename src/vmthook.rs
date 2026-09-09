@@ -525,8 +525,10 @@ impl HookFunction {
         Ok(Self { hook_id, context })
     }
 
-    pub fn set_enabled(&self, enabled: bool) {
-        self.context.set_enabled(enabled);
+    /// Changes handler execution state. Returns `false` when a panicked hook
+    /// rejects an attempt to re-enable it.
+    pub fn set_enabled(&self, enabled: bool) -> bool {
+        self.context.set_enabled(enabled)
     }
 
     pub fn diagnostics(&self) -> HookDiagnostics {
@@ -571,6 +573,12 @@ impl fmt::Debug for HookFunction {
             .debug_struct("HookFunction")
             .field("hook_id", &self.hook_id)
             .finish()
+    }
+}
+
+impl Drop for HookFunction {
+    fn drop(&mut self) {
+        // Intentionally empty: the strong registry owns the process-lifetime hook.
     }
 }
 
@@ -845,6 +853,39 @@ mod tests {
             unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
                 .unwrap_err();
         assert!(matches!(error, HookError::DuplicateHook { slot: 0, .. }));
+    }
+
+    #[test]
+    fn concurrent_duplicate_installation_has_one_winner() {
+        let target = leak_target() as usize;
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let start = Arc::clone(&start);
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                unsafe {
+                    HookFunction::new_pre::<u32, _, _>(
+                        target as *mut HookTarget,
+                        0,
+                        |_: &HookTarget, _: u32| {},
+                    )
+                }
+            }));
+        }
+        start.wait();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(HookError::DuplicateHook { .. })))
+                .count(),
+            1
+        );
     }
 
     #[test]
