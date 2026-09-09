@@ -13,8 +13,11 @@ pub(crate) fn get_immediate(op: Operation) -> Result<isize> {
             let imm12 = bitfield.imm12();
             Ok((((imm12 as isize) << 52) >> 52) * 8)
         }
-        Operation::BRANCH_IMM(BRANCH_IMM::B_ADDR_PCREL26(bitfield))
-        | Operation::BRANCH_IMM(BRANCH_IMM::BL_ADDR_PCREL26(bitfield)) => {
+        Operation::BRANCH_IMM(BRANCH_IMM::B_ADDR_PCREL26(bitfield)) => {
+            let imm26 = bitfield.imm26();
+            Ok((((imm26 as isize) << 38) >> 38) * 4)
+        }
+        Operation::BRANCH_IMM(BRANCH_IMM::BL_ADDR_PCREL26(bitfield)) => {
             let imm26 = bitfield.imm26();
             Ok((((imm26 as isize) << 38) >> 38) * 4)
         }
