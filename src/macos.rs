@@ -55,12 +55,12 @@ impl Module {
         })
     }
 
-    pub fn export<F>(&self, name: &[u8]) -> Result<libloading::Symbol<F>> {
+    pub fn export<F>(&self, name: &[u8]) -> Result<libloading::Symbol<'_, F>> {
         Ok(unsafe { self.ll.get(name) }?)
     }
 }
 
-fn find_code_range_for_image(ll: &libloading::Library, name: &str) -> Result<(usize, usize)> {
+fn find_code_range_for_image(_ll: &libloading::Library, name: &str) -> Result<(usize, usize)> {
     let (mach_header, slide) = (|| {
         let image_count = unsafe { _dyld_image_count() };
         for i in 0..image_count {
@@ -96,7 +96,7 @@ fn find_code_range_for_image(ll: &libloading::Library, name: &str) -> Result<(us
         .expect("Failed to get load commands");
 
     while let Some(command) = load_commands.next()? {
-        if let Some((segment, slice)) = command.segment_64()? {
+        if let Some((segment, _slice)) = command.segment_64()? {
             if segment.name() == b"__TEXT" {
                 let address = segment.vmaddr(LittleEndian) as usize;
                 let size = segment.vmsize(LittleEndian) as usize;

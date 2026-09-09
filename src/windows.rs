@@ -63,7 +63,7 @@ impl Module {
         })
     }
 
-    pub fn export<F>(&self, name: &[u8]) -> Result<libloading::Symbol<F>> {
+    pub fn export<F>(&self, name: &[u8]) -> Result<libloading::Symbol<'_, F>> {
         Ok(unsafe { self.ll.get(name) }?)
     }
 }

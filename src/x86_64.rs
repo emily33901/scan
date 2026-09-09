@@ -37,7 +37,7 @@ impl RTTICompleteObjectLocator {
         let image_base = (self as *const _ as usize).saturating_sub(self.self_offset as usize);
         let descriptor_address = image_base + self.descriptor_offset as usize;
 
-        unsafe { std::mem::transmute(descriptor_address) }
+        unsafe { &*std::ptr::with_exposed_provenance::<TypeDescriptor>(descriptor_address) }
     }
 }
 
