@@ -199,7 +199,8 @@ macro_rules! impl_func {
                                 // Hook instance
                                 Arc<Mutex<HookInstance>>,
                             ) = {
-                            let hook_instance = HookInstance::for_instance(this as *mut ());
+                            let hook_instance = HookInstance::for_instance(this as *mut ())
+                                .expect("dispatch instance was validated during hook installation");
                             let h = hook_instance.lock();
                             let closure = h.closure(index);
                             let original_function = h.original_function(index);

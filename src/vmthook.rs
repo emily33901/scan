@@ -1,14 +1,21 @@
+mod memory;
 pub mod thunk;
 
-use core::slice;
 use std::{
     collections::HashMap,
+    mem::{align_of, size_of},
+    ptr,
     sync::{Arc, OnceLock, Weak},
 };
 
 use anyhow::{bail, Result};
+use memory::{
+    checked_pointer_address, ensure_executable, ensure_readable, MemoryMap, ProcessMemoryMap,
+};
 use parking_lot::{Mutex, MutexGuard};
 use thunk::{ThunkableClosure, TrampolineStorage};
+
+const DEFAULT_MAX_VTABLE_SLOTS: usize = 4096;
 
 thread_local! {
     static GLOBAL_TRAMPOLINE_STORAGE: TrampolineStorage = TrampolineStorage::new().unwrap();
@@ -40,34 +47,54 @@ impl HookInstance {
         hooked_instances
     }
 
-    fn for_instance(instance: *mut ()) -> Arc<Mutex<HookInstance>> {
+    fn for_instance(instance: *mut ()) -> Result<Arc<Mutex<HookInstance>>> {
         let mut hooked_instances = HookInstance::all_hooked_instances();
 
         if let Some(hook) = hooked_instances
             .get(&Instance(instance))
             .and_then(|hook| hook.upgrade())
         {
-            return hook;
+            return Ok(hook);
         }
 
-        let hook_instance = Arc::new(Mutex::new(HookInstance::new(instance)));
+        let hook_instance = Arc::new(Mutex::new(HookInstance::new(instance)?));
 
         hooked_instances.insert(Instance(instance), Arc::downgrade(&hook_instance));
 
-        hook_instance
+        Ok(hook_instance)
     }
 
-    unsafe fn count_funcs(table: *const *const ()) -> usize {
-        for i in 0.. {
-            if (*table.wrapping_add(i)).is_null() {
-                return i;
+    unsafe fn count_funcs<M: MemoryMap>(
+        table: *const *const (),
+        max_slots: usize,
+        map: &M,
+    ) -> Result<usize> {
+        let base = table as usize;
+        let region = map.region_containing(base)?;
+        if !region.readable || !region.contains(base, size_of::<*const ()>()) {
+            bail!("vtable does not begin in readable memory");
+        }
+        // DELIBERATE DEFERRAL: exact C++ vtable lengths are ABI- and class-specific.
+        // Keep the observed null-terminator heuristic, but constrain it to one mapping
+        // and a hard slot cap so an unfamiliar table fails closed.
+        for index in 0..max_slots {
+            let address = checked_pointer_address(base, index)?;
+            if !region.contains(address, size_of::<*const ()>()) {
+                bail!("vtable mapping boundary reached before its null terminator");
+            }
+            if unsafe { ptr::read(address as *const *const ()) }.is_null() {
+                return Ok(index);
             }
         }
-        unreachable!("table must end at some point")
+        bail!("vtable has no null terminator within the {max_slots}-slot limit")
     }
 
-    unsafe fn get_table(instance: *const ()) -> *const *const () {
-        *(instance as *const *const *const ())
+    unsafe fn get_table<M: MemoryMap>(instance: *const (), map: &M) -> Result<*const *const ()> {
+        validate_pointer(instance as usize, "instance")?;
+        ensure_readable(map, instance as usize, size_of::<*const *const ()>())?;
+        let table = unsafe { ptr::read(instance as *const *const *const ()) };
+        validate_pointer(table as usize, "vtable")?;
+        Ok(table)
     }
 
     #[allow(dead_code)]
@@ -80,22 +107,28 @@ impl HookInstance {
         *pointer_to_table = new_table;
     }
 
-    pub fn new(instance: *mut ()) -> Self {
-        let original_table = unsafe { Self::get_table(instance) };
+    pub fn new(instance: *mut ()) -> Result<Self> {
+        let map = ProcessMemoryMap;
+        let original_table = unsafe { Self::get_table(instance, &map)? };
 
-        let table_len = unsafe { Self::count_funcs(original_table) };
-        let new_table: Box<_> = unsafe { slice::from_raw_parts(original_table, table_len) }
-            .to_vec()
-            .into_boxed_slice();
+        let table_len =
+            unsafe { Self::count_funcs(original_table, DEFAULT_MAX_VTABLE_SLOTS, &map)? };
+        let mut entries = Vec::with_capacity(table_len);
+        for index in 0..table_len {
+            let address = checked_pointer_address(original_table as usize, index)?;
+            // Discovery validated this whole range one entry at a time above.
+            entries.push(unsafe { ptr::read(address as *const *const ()) });
+        }
+        let new_table = entries.into_boxed_slice();
 
         unsafe { Self::replace_table_pointer(instance, new_table.as_ptr()) };
 
-        Self {
+        Ok(Self {
             original_table,
             instance,
             new_table,
             closures: Default::default(),
-        }
+        })
     }
 
     pub fn closure(&self, index: usize) -> *const dyn Fn() {
@@ -108,6 +141,8 @@ impl HookInstance {
 
     pub fn hook_function(&mut self, index: usize, f: *const ()) -> Result<()> {
         ensure_range(index, self.new_table.len())?;
+        let original = self.original_function(index);
+        ensure_executable(&ProcessMemoryMap, original as usize)?;
         self.new_table[index] = f;
         Ok(())
     }
@@ -146,10 +181,20 @@ impl HookInstance {
 }
 
 fn ensure_range(index: usize, max: usize) -> Result<()> {
-    if index > max {
+    if index >= max {
         bail!("index {index} is outside the table len {max}");
     }
 
+    Ok(())
+}
+
+fn validate_pointer(address: usize, description: &str) -> Result<()> {
+    if address == 0 {
+        bail!("{description} pointer is null");
+    }
+    if address % align_of::<*const ()>() != 0 {
+        bail!("{description} pointer {address:#x} is not pointer-aligned");
+    }
     Ok(())
 }
 
@@ -201,7 +246,7 @@ impl HookFunction {
         index: usize,
         f: impl ThunkableClosure<R, T, Args>,
     ) -> Result<Self> {
-        let instance_hook = HookInstance::for_instance(instance as *mut ());
+        let instance_hook = HookInstance::for_instance(instance as *mut ())?;
 
         instance_hook.lock().hook_function_with_closure(index, f)?;
 
@@ -218,5 +263,80 @@ impl Drop for HookFunction {
             .lock()
             .unhook_function_with_closure(self.index)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memory::MemoryRegion;
+
+    struct TableMap {
+        region: MemoryRegion,
+    }
+
+    impl MemoryMap for TableMap {
+        fn region_containing(&self, address: usize) -> Result<MemoryRegion> {
+            if (self.region.start..self.region.end).contains(&address) {
+                Ok(self.region)
+            } else {
+                bail!("mapping boundary reached")
+            }
+        }
+    }
+
+    fn map_for(entries: &[*const ()], mapped_entries: usize) -> TableMap {
+        let start = entries.as_ptr() as usize;
+        TableMap {
+            region: MemoryRegion {
+                start,
+                end: start + mapped_entries * size_of::<*const ()>(),
+                readable: true,
+                executable: false,
+            },
+        }
+    }
+
+    #[test]
+    fn discovers_null_terminated_table() {
+        let entries = [1usize as *const (), 2usize as *const (), ptr::null()];
+        let map = map_for(&entries, entries.len());
+
+        let count = unsafe { HookInstance::count_funcs(entries.as_ptr(), 8, &map) }.unwrap();
+
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn rejects_table_without_terminator_before_cap() {
+        let entries = [1usize as *const (), 2usize as *const ()];
+        let map = map_for(&entries, entries.len());
+
+        let error = unsafe { HookInstance::count_funcs(entries.as_ptr(), 2, &map) }.unwrap_err();
+
+        assert!(error.to_string().contains("2-slot limit"));
+    }
+
+    #[test]
+    fn rejects_mapping_boundary_before_terminator() {
+        let entries = [1usize as *const (), 2usize as *const (), ptr::null()];
+        let map = map_for(&entries, 2);
+
+        let error = unsafe { HookInstance::count_funcs(entries.as_ptr(), 3, &map) }.unwrap_err();
+
+        assert!(error.to_string().contains("mapping boundary"));
+    }
+
+    #[test]
+    fn rejects_slot_at_or_beyond_table_length() {
+        assert!(ensure_range(2, 2).is_err());
+        assert!(ensure_range(3, 2).is_err());
+        assert!(ensure_range(1, 2).is_ok());
+    }
+
+    #[test]
+    fn rejects_null_and_misaligned_pointers() {
+        assert!(validate_pointer(0, "test").is_err());
+        assert!(validate_pointer(1, "test").is_err());
     }
 }
