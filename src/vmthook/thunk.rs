@@ -25,6 +25,7 @@ pub trait DispatchControl: Send + Sync {
     fn thunk_cranelift_sig(&self, module: &mut JITModule) -> Signature;
     fn original_cranelift_sig(&self, module: &mut JITModule) -> Signature;
     fn set_enabled(&self, enabled: bool) -> bool;
+    fn retire(&self, status: HookStatus);
     fn diagnostics(&self) -> HookDiagnostics;
 }
 
@@ -68,6 +69,7 @@ impl DispatchState {
     const ENABLED: u8 = 0;
     const DISABLED: u8 = 1;
     const PANICKED: u8 = 2;
+    const RETIRED: u8 = 3;
 
     fn new(hook_id: HookId) -> Self {
         Self {
@@ -106,8 +108,8 @@ impl DispatchState {
         } else {
             loop {
                 let state = self.run_state.load(Ordering::Acquire);
-                if state == Self::PANICKED || state == Self::DISABLED {
-                    return state == Self::DISABLED;
+                if state == Self::PANICKED || state == Self::RETIRED || state == Self::DISABLED {
+                    return true;
                 }
                 if self
                     .run_state
@@ -122,6 +124,14 @@ impl DispatchState {
                     return true;
                 }
             }
+        }
+    }
+
+    fn inactive_status(&self) -> HookStatus {
+        match self.run_state.load(Ordering::Acquire) {
+            Self::PANICKED => HookStatus::Panicked,
+            Self::RETIRED => HookStatus::Restored,
+            _ => HookStatus::Disabled,
         }
     }
 }
@@ -167,7 +177,7 @@ macro_rules! impl_func {
                         increment_saturated(&context.state.invocations);
                         if context.state.run_state.load(Ordering::Acquire) != DispatchState::ENABLED {
                             increment_saturated(&context.state.bypasses);
-                            context.state.last_status.store(HookStatus::Disabled as u8, Ordering::Relaxed);
+                            context.state.last_status.store(context.state.inactive_status() as u8, Ordering::Relaxed);
                             return unsafe { (context.original_fn)(this, $($args,)*) };
                         }
                         if context.state.busy.compare_exchange(
@@ -182,7 +192,7 @@ macro_rules! impl_func {
                         let _busy = BusyGuard(&context.state.busy);
                         if context.state.run_state.load(Ordering::Acquire) != DispatchState::ENABLED {
                             increment_saturated(&context.state.bypasses);
-                            context.state.last_status.store(HookStatus::Disabled as u8, Ordering::Relaxed);
+                            context.state.last_status.store(context.state.inactive_status() as u8, Ordering::Relaxed);
                             return unsafe { (context.original_fn)(this, $($args,)*) };
                         }
                         context.state.last_status.store(HookStatus::Running as u8, Ordering::Relaxed);
@@ -227,6 +237,10 @@ macro_rules! impl_func {
                 }
 
                 fn set_enabled(&self, enabled: bool) -> bool { self.state.set_enabled(enabled) }
+                fn retire(&self, status: HookStatus) {
+                    self.state.run_state.store(DispatchState::RETIRED, Ordering::Release);
+                    self.state.last_status.store(status as u8, Ordering::Relaxed);
+                }
                 fn diagnostics(&self) -> HookDiagnostics { self.state.diagnostics() }
             }
 

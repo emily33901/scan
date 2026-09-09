@@ -45,6 +45,7 @@ pub enum HookError {
     DuplicateHook { instance: usize, slot: usize },
     VptrConflict { expected: usize, actual: usize },
     InstanceRestored,
+    HookNotFound(HookId),
     UnsupportedTarget,
     Jit(String),
 }
@@ -69,6 +70,7 @@ impl fmt::Display for HookError {
             Self::InstanceRestored => {
                 f.write_str("restored hook instances cannot currently be hooked again")
             }
+            Self::HookNotFound(id) => write!(f, "hook {} was not found", id.0),
             Self::UnsupportedTarget => f.write_str("vtable hooking is unsupported on this target"),
         }
     }
@@ -104,6 +106,7 @@ pub enum HookStatus {
     BusyBypass,
     Disabled,
     Panicked,
+    Restored,
 }
 
 impl HookStatus {
@@ -113,6 +116,7 @@ impl HookStatus {
             2 => Self::BusyBypass,
             3 => Self::Disabled,
             4 => Self::Panicked,
+            5 => Self::Restored,
             _ => Self::Ready,
         }
     }
@@ -455,6 +459,15 @@ impl HookFunction {
         unsafe { Self::new_pre_with_options(instance, index, f, HookOptions::default()) }
     }
 
+    /// Installs a pre-hook with discovery and naming options.
+    ///
+    /// The first successful install fixes the instance's discovered table size;
+    /// `max_vtable_slots` is ignored for later slots on that instance.
+    ///
+    /// # Safety
+    /// `instance` must identify a live compatible C++ object for the process
+    /// lifetime, its original module must remain loaded, and foreign mutation
+    /// must not violate the shared callback reference's aliasing requirements.
     pub unsafe fn new_pre_with_options<R: 'static, T: 'static, Args: 'static>(
         instance: *mut T,
         index: usize,
@@ -498,6 +511,8 @@ impl HookFunction {
         let original = state.original_function(index);
         ensure_executable(&ProcessMemoryMap, original as usize)
             .map_err(|error| HookError::InvalidVtable(error.to_string()))?;
+        // Complete every fallible table read before emitting unreachable JIT code.
+        let mut generation = state.next_generation()?;
         let hook_id = HookId::next();
         let context: Arc<dyn DispatchControl> =
             Arc::from(unsafe { f.into_dispatch(original, hook_id) });
@@ -505,9 +520,15 @@ impl HookFunction {
             .map_err(|error| HookError::Jit(error.to_string()))?
             .make_trampoline(&*context, hook_id)
             .map_err(|error| HookError::Jit(error.to_string()))?;
-        let mut generation = state.next_generation()?;
         *generation.function_entry_mut(index) = trampoline;
         let replacement = generation.address_point();
+        state.generations.reserve(1);
+        state.slots.reserve(1);
+        if new_instance {
+            registry.instances.reserve(1);
+        }
+        registry.by_slot.reserve(1);
+        registry.by_id.reserve(1);
         state.compare_exchange_vptr(expected, replacement)?;
         state.generations.push(generation);
         state.slots.insert(index, hook_id);
@@ -559,6 +580,38 @@ impl HookFunction {
         registry.by_id.get(&id).map(|record| record.info(id))
     }
 
+    pub fn lookup_name(name: &str) -> Vec<HookInfo> {
+        let registry = registry().lock();
+        let mut hooks: Vec<_> = registry
+            .by_id
+            .iter()
+            .filter(|(_, record)| record.name.as_deref() == Some(name))
+            .map(|(&id, record)| record.info(id))
+            .collect();
+        hooks.sort_by_key(|info| info.hook_id);
+        hooks
+    }
+
+    pub fn list_all() -> Vec<HookInfo> {
+        let registry = registry().lock();
+        let mut hooks: Vec<_> = registry
+            .by_id
+            .iter()
+            .map(|(&id, record)| record.info(id))
+            .collect();
+        hooks.sort_by_key(|info| info.hook_id);
+        hooks
+    }
+
+    pub fn set_enabled_by_id(hook_id: HookId, enabled: bool) -> HookResult<bool> {
+        let registry = registry().lock();
+        let record = registry
+            .by_id
+            .get(&hook_id)
+            .ok_or(HookError::HookNotFound(hook_id))?;
+        Ok(record.context.set_enabled(enabled))
+    }
+
     pub fn list_for_instance<T>(instance: *mut T) -> Vec<HookInfo> {
         let key = Instance(instance.cast());
         let registry = registry().lock();
@@ -600,7 +653,8 @@ impl HookRecord {
     }
 }
 
-/// Restores an instance's original vptr if scan still owns the latest vptr.
+/// Retires all handlers and restores the original vptr if scan still owns it.
+/// A vptr conflict leaves foreign state untouched and handlers disabled.
 ///
 /// # Safety
 /// The object must still be live and host calls must be quiescent for restoration.
@@ -612,13 +666,23 @@ pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
         .get(&key)
         .ok_or(HookError::InvalidPointer("instance is not managed".into()))?;
     let mut state = state.lock();
+    if state.restored {
+        return Err(HookError::InstanceRestored);
+    }
     for id in state.slots.values() {
         if let Some(record) = registry.by_id.get(id) {
-            record.context.set_enabled(false);
+            record.context.retire(HookStatus::Disabled);
         }
     }
     let expected = state.latest_table();
-    state.compare_exchange_vptr(expected, state.original_table)?;
+    if let Err(error) = state.compare_exchange_vptr(expected, state.original_table) {
+        return Err(error);
+    }
+    for id in state.slots.values() {
+        if let Some(record) = registry.by_id.get(id) {
+            record.context.retire(HookStatus::Restored);
+        }
+    }
     state.restored = true;
     // DEFERRED(vmthook): generations, trampolines, and contexts are never
     // reclaimed because callers may still be executing through an old vptr.
@@ -951,10 +1015,10 @@ mod tests {
             })
         }
         .unwrap();
-        hook.set_enabled(false);
+        assert!(HookFunction::set_enabled_by_id(hook.id(), false).unwrap());
         assert_eq!(unsafe { call_slot(target, 0, 5) }, 15);
         assert_eq!(unsafe { &*target }.calls.load(Ordering::Relaxed), 1);
-        hook.set_enabled(true);
+        assert!(HookFunction::set_enabled_by_id(hook.id(), true).unwrap());
         assert_eq!(unsafe { call_slot(target, 0, 6) }, 16);
         assert_eq!(unsafe { &*target }.calls.load(Ordering::Relaxed), 102);
     }
@@ -969,6 +1033,8 @@ mod tests {
         unsafe { restore_instance(target) }.unwrap();
         assert_eq!(unsafe { (*target).vptr }, original);
         assert!(!hook.diagnostics().enabled);
+        assert_eq!(hook.diagnostics().last_status, HookStatus::Restored);
+        assert!(!hook.set_enabled(true));
 
         let conflicted = leak_target();
         let conflict_hook = unsafe {
@@ -983,5 +1049,33 @@ mod tests {
         ));
         assert_eq!(unsafe { (*conflicted).vptr }, foreign);
         assert!(!conflict_hook.diagnostics().enabled);
+        assert!(!conflict_hook.set_enabled(true));
+    }
+
+    #[test]
+    fn registry_discovers_named_hooks() {
+        let target = leak_target();
+        let name = format!("named-hook-{}", target as usize);
+        let hook = unsafe {
+            HookFunction::new_pre_with_options::<u32, _, _>(
+                target,
+                0,
+                |_: &HookTarget, _: u32| {},
+                HookOptions {
+                    name: Some(name.clone()),
+                    ..HookOptions::default()
+                },
+            )
+        }
+        .unwrap();
+
+        assert_eq!(HookFunction::lookup_name(&name)[0].hook_id, hook.id());
+        assert!(HookFunction::list_all()
+            .iter()
+            .any(|info| info.hook_id == hook.id()));
+        assert!(matches!(
+            HookFunction::set_enabled_by_id(HookId(u64::MAX), false),
+            Err(HookError::HookNotFound(_))
+        ));
     }
 }
