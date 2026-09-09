@@ -5,7 +5,10 @@ use std::{
     collections::HashMap,
     mem::{align_of, size_of},
     ptr,
-    sync::{Arc, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock, Weak,
+    },
 };
 
 use anyhow::{bail, Result};
@@ -13,9 +16,51 @@ use memory::{
     checked_pointer_address, ensure_executable, ensure_readable, MemoryMap, ProcessMemoryMap,
 };
 use parking_lot::{Mutex, MutexGuard};
-use thunk::{ThunkableClosure, TrampolineStorage};
+use thunk::{DispatchControl, ThunkablePreHook, TrampolineStorage};
 
 const DEFAULT_MAX_VTABLE_SLOTS: usize = 4096;
+static NEXT_HOOK_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HookId(u64);
+
+impl HookId {
+    fn next() -> Self {
+        Self(NEXT_HOOK_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookStatus {
+    Ready,
+    Running,
+    BusyBypass,
+    Disabled,
+    Panicked,
+}
+
+impl HookStatus {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Running,
+            2 => Self::BusyBypass,
+            3 => Self::Disabled,
+            4 => Self::Panicked,
+            _ => Self::Ready,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HookDiagnostics {
+    pub hook_id: HookId,
+    pub enabled: bool,
+    pub invocations: u64,
+    pub bypasses: u64,
+    pub panics: u64,
+    pub last_status: HookStatus,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VtableAbi {
@@ -111,23 +156,29 @@ impl ClonedVtable {
     }
 }
 
-thread_local! {
-    static GLOBAL_TRAMPOLINE_STORAGE: TrampolineStorage = TrampolineStorage::new().unwrap();
-}
-
 #[repr(transparent)]
 #[derive(PartialEq, Eq, PartialOrd, Hash)]
 struct Instance(*mut ());
 unsafe impl Send for Instance {}
 unsafe impl Sync for Instance {}
 
-#[derive(Debug)]
 struct HookInstance {
     instance: *mut (),
     original_table: *const *const (),
     new_table: ClonedVtable,
-    // NOTE(emily): These are not actually 0 arg functions
-    closures: HashMap<usize, *const dyn Fn()>,
+    contexts: HashMap<usize, Box<dyn DispatchControl>>,
+}
+
+impl std::fmt::Debug for HookInstance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HookInstance")
+            .field("instance", &self.instance)
+            .field("original_table", &self.original_table)
+            .field("new_table", &self.new_table)
+            .field("hooked_slots", &self.contexts.keys())
+            .finish()
+    }
 }
 
 impl HookInstance {
@@ -217,12 +268,8 @@ impl HookInstance {
             original_table,
             instance,
             new_table,
-            closures: Default::default(),
+            contexts: Default::default(),
         })
-    }
-
-    pub fn closure(&self, index: usize) -> *const dyn Fn() {
-        self.closures[&index]
     }
 
     pub fn original_function(&self, index: usize) -> *const () {
@@ -244,28 +291,29 @@ impl HookInstance {
         Ok(())
     }
 
-    fn hook_function_with_closure<R: 'static, T: 'static, Args: 'static>(
+    unsafe fn hook_function_with_pre_hook<R: 'static, T: 'static, Args: 'static>(
         &mut self,
         index: usize,
-        f: impl ThunkableClosure<R, T, Args>,
+        f: impl ThunkablePreHook<R, T, Args>,
+        hook_id: HookId,
     ) -> Result<()> {
-        let trampoline = GLOBAL_TRAMPOLINE_STORAGE.with(|thunk_storage| {
-            let mut module = thunk_storage.module();
-            f.make_trampoline(&mut module, index)
-        })?;
-
-        let closure = f.into_raw_closure();
-
+        ensure_range(index, self.new_table.len())?;
+        if self.contexts.contains_key(&index) {
+            bail!("vtable slot {index} is already hooked");
+        }
+        let original = self.original_function(index);
+        ensure_executable(&ProcessMemoryMap, original as usize)?;
+        let context = unsafe { f.into_dispatch(original, hook_id) };
+        let trampoline = TrampolineStorage::global()?.make_trampoline(&*context, hook_id)?;
         self.hook_function(index, trampoline)?;
-        self.closures.insert(index, closure);
-
+        self.contexts.insert(index, context);
         Ok(())
     }
 
     fn unhook_function_with_closure(&mut self, index: usize) -> Result<()> {
         self.unhook_function(index)?;
 
-        self.closures.remove(&index);
+        self.contexts.remove(&index);
 
         Ok(())
     }
@@ -306,45 +354,60 @@ pub struct HookFunction {
 }
 
 impl HookFunction {
-    /// Hook a function in an instances vtable, providing a closure that will be called instead of the
-    /// original.
-    /// The closure provided should take a `ctx`, `&mut this` and arguments of the function being called.
+    /// Installs a pre-hook which runs before the captured original function.
     ///
     /// When the [`HookFunction`] is dropped, the function will be un-hooked.
     ///
     ///
-    /// All arguments of the function are expected to be able to be made into
+    /// The original is invoked exactly once, even if the pre-hook panics. A panic
+    /// permanently disables the handler. Nested and concurrent entries bypass the
+    /// handler without blocking and call the original directly.
+    ///
+    /// All arguments must be `Copy` and representable as
     /// [CraneLift basic types](https://docs.rs/cranelift-codegen/latest/cranelift_codegen/ir/types/index.html).
     /// If you need to do this for a custom type, then consider implementing [`crate::AsCraneliftAbi`] for it.
     ///
     ///
-    /// # Example
+    /// # Safety
     ///
-    /// ```rs
-    ///  let instance_function_hook = HookFunction::new(
-    ///      instance,
-    ///      10,
-    ///      |ctx, this, arg: usize| -> usize {
-    ///         let arg = arg + 10
-    ///         call_original(ctx, this, (arg,))
-    ///     },
-    /// )
-    /// .unwrap();
-    /// ```
+    /// `instance` must identify a live object with a compatible C++ vtable and
+    /// remain alive while hooked. The original module must remain loaded. The
+    /// callback's shared reference assumes foreign code does not mutate the object
+    /// incompatibly while it runs.
     ///
-    pub fn new<R: 'static, T: 'static, Args: 'static>(
+    /// DEFERRED(vmthook): replace `&T` with an honest raw-pointer API before
+    /// permitting concurrent or reentrant handlers.
+    pub unsafe fn new_pre<R: 'static, T: 'static, Args: 'static>(
         instance: *mut T,
         index: usize,
-        f: impl ThunkableClosure<R, T, Args>,
+        f: impl ThunkablePreHook<R, T, Args>,
     ) -> Result<Self> {
         let instance_hook = HookInstance::for_instance(instance as *mut ())?;
-
-        instance_hook.lock().hook_function_with_closure(index, f)?;
+        let hook_id = HookId::next();
+        unsafe {
+            instance_hook
+                .lock()
+                .hook_function_with_pre_hook(index, f, hook_id)?;
+        }
 
         Ok(Self {
             index,
             instance_hook,
         })
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        if let Some(context) = self.instance_hook.lock().contexts.get(&self.index) {
+            context.enabled().store(enabled, Ordering::Release);
+        }
+    }
+
+    pub fn diagnostics(&self) -> Option<HookDiagnostics> {
+        self.instance_hook
+            .lock()
+            .contexts
+            .get(&self.index)
+            .map(|context| context.diagnostics())
     }
 }
 
