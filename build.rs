@@ -1,15 +1,19 @@
-/// On MacOS we are using disarm64 to decode arm64 instructions and then get immediates from those.
-/// disarm64 takes an incredibly long time to build by default as it builds decision trees for the entire
-/// instruction set, which we don't care about, we maybe use 4 instructions, so we can cut down
-/// quite significantly on the build time if we just use those.
-/// This function will do the work of getting the git repo, and running disarm64_gen to build a decoder
-/// which can then be `include!`ed in scan.
+// On macOS we use disarm64 to decode arm64 instructions and extract their immediates.
+// Generating its complete instruction decoder is extremely slow, so the build script
+// generates a decoder containing only the four instruction classes scan needs.
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn main() -> anyhow::Result<()> {
+type BuildResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+fn ensure_success(success: bool, action: &'static str) -> BuildResult {
+    if success {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(action).into())
+    }
+}
+
+fn generate_arm64_decoder() -> BuildResult {
     use std::{path::PathBuf, process::Command};
-
-    use anyhow::ensure;
 
     const DISARM64_REVISION: &str = "4a5744dddcf7377172f7e33bd4483f7e31688171";
 
@@ -27,13 +31,19 @@ fn main() -> anyhow::Result<()> {
             "https://github.com/kromych/disarm64",
         ]);
 
-        ensure!(command.spawn()?.wait()?.success());
+        ensure_success(
+            command.spawn()?.wait()?.success(),
+            "failed to clone disarm64",
+        )?;
     }
 
     let current_revision = Command::new("git")
         .args(["-C", "disarm64", "rev-parse", "HEAD"])
         .output()?;
-    ensure!(current_revision.status.success());
+    ensure_success(
+        current_revision.status.success(),
+        "failed to inspect disarm64 revision",
+    )?;
     if String::from_utf8(current_revision.stdout)?.trim() != DISARM64_REVISION {
         let mut command = Command::new("git");
         command.args([
@@ -45,11 +55,17 @@ fn main() -> anyhow::Result<()> {
             "origin",
             DISARM64_REVISION,
         ]);
-        ensure!(command.spawn()?.wait()?.success());
+        ensure_success(
+            command.spawn()?.wait()?.success(),
+            "failed to fetch disarm64",
+        )?;
 
         let mut command = Command::new("git");
         command.args(["-C", "disarm64", "checkout", "--detach", "FETCH_HEAD"]);
-        ensure!(command.spawn()?.wait()?.success());
+        ensure_success(
+            command.spawn()?.wait()?.success(),
+            "failed to check out disarm64",
+        )?;
     }
 
     std::env::set_current_dir(output_dir.join("disarm64"))?;
@@ -68,12 +84,18 @@ fn main() -> anyhow::Result<()> {
         output_decoder_path.to_str().unwrap(),
     ]);
 
-    ensure!(command.spawn()?.wait()?.success());
+    ensure_success(
+        command.spawn()?.wait()?.success(),
+        "failed to generate arm64 decoder",
+    )?;
 
     let mut command = Command::new("rustfmt");
     command.args([output_decoder_path.to_str().unwrap()]);
 
-    ensure!(command.spawn()?.wait()?.success());
+    ensure_success(
+        command.spawn()?.wait()?.success(),
+        "failed to format arm64 decoder",
+    )?;
 
     // Write a mod.rs
     std::fs::write(
@@ -91,8 +113,16 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-fn main() {}
+fn main() -> BuildResult {
+    println!("cargo::rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo::rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-fn main() {}
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS")?;
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH")?;
+
+    if target_os == "macos" && target_arch == "aarch64" {
+        generate_arm64_decoder()?;
+    }
+
+    Ok(())
+}
