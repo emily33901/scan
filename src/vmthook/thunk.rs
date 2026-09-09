@@ -102,7 +102,7 @@ macro_rules! impl_func {
             where
                 TRet: 'static + AsCraneliftAbi,
                 TThis: 'static,
-                $($Args: Copy + Send + Sync + 'static + AsCraneliftAbi,)*
+                $($Args: Copy + 'static + AsCraneliftAbi,)*
                 TClosure: Fn(&TThis, $($Args,)*) + Send + Sync + 'static,
             {
                 fn context_address(&self) -> *const () {
@@ -117,7 +117,7 @@ macro_rules! impl_func {
                     ) -> TRet
                     where
                         TThis: 'static,
-                        $($Args: Copy + Send + Sync + 'static,)*
+                        $($Args: Copy + 'static,)*
                         TClosure: Fn(&TThis, $($Args,)*) + Send + Sync + 'static,
                     {
                         let context = unsafe { &*context };
@@ -184,7 +184,7 @@ macro_rules! impl_func {
             where
                 TRet: 'static + AsCraneliftAbi,
                 TThis: 'static,
-                $($Args: Copy + Send + Sync + 'static + AsCraneliftAbi,)*
+                $($Args: Copy + 'static + AsCraneliftAbi,)*
                 TClosure: Fn(&TThis, $($Args,)*) + Send + Sync + 'static,
             {
                 unsafe fn into_dispatch(

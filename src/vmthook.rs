@@ -362,6 +362,8 @@ impl HookFunction {
     /// The original is invoked exactly once, even if the pre-hook panics. A panic
     /// permanently disables the handler. Nested and concurrent entries bypass the
     /// handler without blocking and call the original directly.
+    /// Panic containment requires an unwind panic strategy; native faults and
+    /// foreign exceptions are not caught.
     ///
     /// All arguments must be `Copy` and representable as
     /// [CraneLift basic types](https://docs.rs/cranelift-codegen/latest/cranelift_codegen/ir/types/index.html).
