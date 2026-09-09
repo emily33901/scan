@@ -616,6 +616,7 @@ mod tests {
     use super::*;
     use anyhow::bail;
     use memory::MemoryRegion;
+    use std::sync::atomic::AtomicU32;
 
     struct TableMap {
         region: MemoryRegion,
@@ -768,5 +769,155 @@ mod tests {
                 .unwrap_err();
 
         assert!(error.to_string().contains("mapping"));
+    }
+
+    #[repr(C)]
+    struct HookTarget {
+        vptr: *const *const (),
+        calls: AtomicU32,
+    }
+
+    unsafe extern "C" fn original_zero(this: *mut HookTarget, value: u32) -> u32 {
+        unsafe { &*this }.calls.fetch_add(1, Ordering::Relaxed);
+        value + 10
+    }
+
+    unsafe extern "C" fn original_one(this: *mut HookTarget, value: u32) -> u32 {
+        unsafe { &*this }.calls.fetch_add(1, Ordering::Relaxed);
+        value + 20
+    }
+
+    fn leak_target() -> *mut HookTarget {
+        let prefix = VtableAbi::current().unwrap().prefix_entries();
+        let mut layout = vec![ptr::null(); prefix];
+        layout.extend([
+            original_zero as *const (),
+            original_one as *const (),
+            ptr::null(),
+        ]);
+        let layout = Box::leak(layout.into_boxed_slice());
+        let vptr = unsafe { layout.as_ptr().add(prefix) };
+        Box::into_raw(Box::new(HookTarget {
+            vptr,
+            calls: AtomicU32::new(0),
+        }))
+    }
+
+    unsafe fn call_slot(target: *mut HookTarget, slot: usize, value: u32) -> u32 {
+        let function: unsafe extern "C" fn(*mut HookTarget, u32) -> u32 =
+            unsafe { std::mem::transmute(*(*target).vptr.add(slot)) };
+        unsafe { function(target, value) }
+    }
+
+    #[test]
+    fn multiple_slots_publish_immutable_generations() {
+        let target = leak_target();
+        let first =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
+                .unwrap();
+        let first_vptr = unsafe { (*target).vptr };
+        let original_slot_one = unsafe { *first_vptr.add(1) };
+        let second =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 1, |_: &HookTarget, _: u32| {}) }
+                .unwrap();
+        let second_vptr = unsafe { (*target).vptr };
+
+        assert_ne!(first_vptr, second_vptr);
+        assert_eq!(unsafe { *first_vptr.add(1) }, original_slot_one);
+        assert_ne!(unsafe { *second_vptr.add(1) }, original_slot_one);
+        assert_eq!(unsafe { call_slot(target, 0, 1) }, 11);
+        assert_eq!(unsafe { call_slot(target, 1, 2) }, 22);
+        assert_eq!(HookFunction::list_for_instance(target).len(), 2);
+        assert_eq!(HookFunction::lookup(first.id()).unwrap().slot, 0);
+        assert_eq!(
+            HookFunction::lookup_slot(target, 1).unwrap().hook_id,
+            second.id()
+        );
+    }
+
+    #[test]
+    fn duplicate_slot_is_rejected() {
+        let target = leak_target();
+        let _hook =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
+                .unwrap();
+        let error =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
+                .unwrap_err();
+        assert!(matches!(error, HookError::DuplicateHook { slot: 0, .. }));
+    }
+
+    #[test]
+    fn dropping_handle_and_install_thread_preserve_hook() {
+        let target = leak_target();
+        let target_address = target as usize;
+        std::thread::spawn(move || {
+            let target = target_address as *mut HookTarget;
+            let hook = unsafe {
+                HookFunction::new_pre::<u32, _, _>(target, 0, |this: &HookTarget, _: u32| {
+                    this.calls.fetch_add(100, Ordering::Relaxed);
+                })
+            }
+            .unwrap();
+            drop(hook);
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(unsafe { call_slot(target, 0, 3) }, 13);
+        assert_eq!(unsafe { &*target }.calls.load(Ordering::Relaxed), 101);
+    }
+
+    #[test]
+    fn dispatch_does_not_lock_registry() {
+        let target = leak_target();
+        let _hook =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
+                .unwrap();
+        let _registry_guard = registry().lock();
+        assert_eq!(unsafe { call_slot(target, 0, 4) }, 14);
+    }
+
+    #[test]
+    fn enable_disable_bypasses_handler() {
+        let target = leak_target();
+        let hook = unsafe {
+            HookFunction::new_pre::<u32, _, _>(target, 0, |this: &HookTarget, _: u32| {
+                this.calls.fetch_add(100, Ordering::Relaxed);
+            })
+        }
+        .unwrap();
+        hook.set_enabled(false);
+        assert_eq!(unsafe { call_slot(target, 0, 5) }, 15);
+        assert_eq!(unsafe { &*target }.calls.load(Ordering::Relaxed), 1);
+        hook.set_enabled(true);
+        assert_eq!(unsafe { call_slot(target, 0, 6) }, 16);
+        assert_eq!(unsafe { &*target }.calls.load(Ordering::Relaxed), 102);
+    }
+
+    #[test]
+    fn restoration_requires_exact_latest_vptr() {
+        let target = leak_target();
+        let original = unsafe { (*target).vptr };
+        let hook =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
+                .unwrap();
+        unsafe { restore_instance(target) }.unwrap();
+        assert_eq!(unsafe { (*target).vptr }, original);
+        assert!(!hook.diagnostics().enabled);
+
+        let conflicted = leak_target();
+        let conflict_hook = unsafe {
+            HookFunction::new_pre::<u32, _, _>(conflicted, 0, |_: &HookTarget, _: u32| {})
+        }
+        .unwrap();
+        let foreign = original;
+        unsafe { (*conflicted).vptr = foreign };
+        assert!(matches!(
+            unsafe { restore_instance(conflicted) },
+            Err(HookError::VptrConflict { .. })
+        ));
+        assert_eq!(unsafe { (*conflicted).vptr }, foreign);
+        assert!(!conflict_hook.diagnostics().enabled);
     }
 }
