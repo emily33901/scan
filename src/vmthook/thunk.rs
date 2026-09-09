@@ -13,6 +13,11 @@ use std::{
 
 use super::{HookDiagnostics, HookId, HookStatus};
 
+mod sealed {
+    pub trait Abi {}
+    pub trait PreHook<R, T, Args> {}
+}
+
 #[doc(hidden)]
 pub trait DispatchControl: Send + Sync {
     fn context_address(&self) -> *const ();
@@ -24,7 +29,8 @@ pub trait DispatchControl: Send + Sync {
 }
 
 #[doc(hidden)]
-pub trait ThunkablePreHook<R, T, Args>: Send + Sync + 'static
+pub trait ThunkablePreHook<R, T, Args>:
+    sealed::PreHook<R, T, Args> + Send + Sync + 'static
 where
     R: 'static,
     T: 'static,
@@ -249,6 +255,15 @@ macro_rules! impl_func {
                     })
                 }
             }
+
+            impl<TClosure, TRet, TThis, $($Args,)*>
+                sealed::PreHook<TRet, TThis, ($($Args,)*)> for TClosure
+            where
+                TRet: 'static + AsCraneliftAbi,
+                TThis: 'static,
+                $($Args: Copy + 'static + AsCraneliftAbi,)*
+                TClosure: Fn(&TThis, $($Args,)*) + Send + Sync + 'static,
+            {}
         }
     };
 }
@@ -329,7 +344,7 @@ impl TrampolineStorage {
 // DEFERRED(vmthook): foreign exceptions and native faults are not contained here.
 // DEFERRED(vmthook): reject aggregate, vector, variadic, and hidden-sret ABIs explicitly.
 
-pub trait AsCraneliftAbi {
+pub trait AsCraneliftAbi: sealed::Abi {
     fn as_cranelift_abi() -> AbiParam;
 }
 
@@ -350,21 +365,25 @@ impl<T> AsCraneliftAbi for *const T {
         AbiParam::new(pointer_type())
     }
 }
+impl<T> sealed::Abi for *const T {}
 impl<T> AsCraneliftAbi for *mut T {
     fn as_cranelift_abi() -> AbiParam {
         AbiParam::new(pointer_type())
     }
 }
+impl<T> sealed::Abi for *mut T {}
 impl<T> AsCraneliftAbi for &mut T {
     fn as_cranelift_abi() -> AbiParam {
         AbiParam::new(pointer_type())
     }
 }
+impl<T> sealed::Abi for &mut T {}
 impl<T> AsCraneliftAbi for &T {
     fn as_cranelift_abi() -> AbiParam {
         AbiParam::new(pointer_type())
     }
 }
+impl<T> sealed::Abi for &T {}
 
 macro_rules! cranelift_abi {
     ($t:ty, $abi:ident) => {
@@ -373,6 +392,7 @@ macro_rules! cranelift_abi {
                 AbiParam::new(types::$abi)
             }
         }
+        impl sealed::Abi for $t {}
     };
 }
 

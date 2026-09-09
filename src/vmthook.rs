@@ -432,9 +432,10 @@ impl HookFunction {
     /// Panic containment requires an unwind panic strategy; native faults and
     /// foreign exceptions are not caught.
     ///
-    /// All arguments must be `Copy` and representable as
-    /// [CraneLift basic types](https://docs.rs/cranelift-codegen/latest/cranelift_codegen/ir/types/index.html).
-    /// If you need to do this for a custom type, then consider implementing [`crate::AsCraneliftAbi`] for it.
+    /// Supported arguments and returns are pointers/references, `f32`, `f64`,
+    /// `usize`, `isize`, and 8/16/32-bit integers. Arguments must be `Copy`.
+    /// Aggregate, vector, variadic, hidden-sret, and custom ABI forms are not
+    /// currently supported.
     ///
     ///
     /// # Safety
