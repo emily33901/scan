@@ -481,6 +481,34 @@ mod tests {
         assert_eq!(diagnostics.bypasses, 1);
         assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
         assert_eq!(target.original_calls.load(Ordering::Relaxed), 2);
+
+        assert!(!dispatch.set_enabled(true));
+        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 3) }, 4);
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn panic_payload_destructor_cannot_escape_dispatch() {
+        struct PanicsOnDrop;
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                panic!("panic payload destructor");
+            }
+        }
+
+        let dispatch = unsafe {
+            make_dispatch(
+                |_this: &Target, _argument: u32| std::panic::panic_any(PanicsOnDrop),
+                15,
+            )
+        };
+        let mut target = Target {
+            original_calls: AtomicU32::new(0),
+        };
+
+        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 7) }, 8);
+        assert_eq!(target.original_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(dispatch.diagnostics().panics, 1);
     }
 
     #[test]
