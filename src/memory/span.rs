@@ -645,6 +645,7 @@ pub type SpanError = ForeignSpanError;
 mod tests {
     use super::*;
     use crate::memory::{MemoryRegion, RegionKind};
+    use std::sync::RwLock;
 
     struct StableMemory(Vec<MemoryRegion>);
 
@@ -724,6 +725,108 @@ mod tests {
         }
     }
 
+    fn region_range(start: usize, len: usize, access: Access) -> MemoryRegion {
+        MemoryRegion {
+            range: Address::new(start).checked_range(len).unwrap(),
+            access,
+            kind: RegionKind::Private,
+            module: None,
+        }
+    }
+
+    struct DynamicMemory(RwLock<Vec<MemoryRegion>>);
+
+    impl MemoryMap for DynamicMemory {
+        fn region_containing(&self, address: Address) -> Result<MemoryRegion, MemoryError> {
+            self.0
+                .read()
+                .unwrap()
+                .iter()
+                .copied()
+                .find(|region| region.contains(address))
+                .ok_or(MemoryError::Unmapped { address })
+        }
+    }
+
+    impl DirectMemoryAccess for DynamicMemory {
+        unsafe fn read_bytes_into(
+            &self,
+            address: Address,
+            output: &mut [u8],
+        ) -> Result<(), MemoryError> {
+            self.check_range(
+                address.checked_range(output.len())?,
+                Access::READ,
+                DEFAULT_MAX_REGIONS,
+            )?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    address.get() as *const u8,
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            };
+            Ok(())
+        }
+
+        unsafe fn write_bytes_from(
+            &self,
+            address: Address,
+            bytes: &[u8],
+        ) -> Result<(), MemoryError> {
+            self.check_range(
+                address.checked_range(bytes.len())?,
+                Access::WRITE,
+                DEFAULT_MAX_REGIONS,
+            )?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), address.get() as *mut u8, bytes.len())
+            };
+            Ok(())
+        }
+    }
+
+    struct PartialWriteMemory {
+        inner: StableMemory,
+        bytes_written: usize,
+    }
+
+    impl MemoryMap for PartialWriteMemory {
+        fn region_containing(&self, address: Address) -> Result<MemoryRegion, MemoryError> {
+            self.inner.region_containing(address)
+        }
+    }
+
+    impl DirectMemoryAccess for PartialWriteMemory {
+        unsafe fn read_bytes_into(
+            &self,
+            address: Address,
+            output: &mut [u8],
+        ) -> Result<(), MemoryError> {
+            unsafe { self.inner.read_bytes_into(address, output) }
+        }
+
+        unsafe fn write_bytes_from(
+            &self,
+            address: Address,
+            bytes: &[u8],
+        ) -> Result<(), MemoryError> {
+            self.check_range(
+                address.checked_range(bytes.len())?,
+                Access::WRITE,
+                DEFAULT_MAX_REGIONS,
+            )?;
+            let actual = self.bytes_written.min(bytes.len());
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), address.get() as *mut u8, actual)
+            };
+            Err(MemoryError::PartialWrite {
+                expected: bytes.len(),
+                actual,
+            })
+        }
+    }
+
     fn layout() -> ForeignVectorLayout {
         ForeignVectorLayout {
             begin_offset: 0,
@@ -792,6 +895,52 @@ mod tests {
     }
 
     #[test]
+    fn non_null_empty_encodings_follow_the_selected_policy() {
+        let element = 9_u32;
+        let pointer = &element as *const u32 as usize;
+        let metadata = [pointer, pointer, pointer];
+        let memory = StableMemory(vec![region(&metadata, Access::READ)]);
+        let vector = Address::new(metadata.as_ptr() as usize);
+
+        for policy in [
+            EmptySpanPolicy::AllowNullOrNonNull,
+            EmptySpanPolicy::RequireNonNull,
+        ] {
+            let mut requested = layout();
+            requested.empty_policy = policy;
+            let span = unsafe {
+                ForeignSpan::from_direct(&memory, vector, requested, Access::READ).unwrap()
+            };
+            assert!(span.is_empty());
+        }
+
+        let mut require_null = layout();
+        require_null.empty_policy = EmptySpanPolicy::RequireNull;
+        assert!(matches!(
+            unsafe { ForeignSpan::from_direct(&memory, vector, require_null, Access::READ) },
+            Err(ForeignSpanError::EmptyPolicyViolation {
+                policy: EmptySpanPolicy::RequireNull
+            })
+        ));
+
+        let null_metadata_without_capacity = [0_usize; 2];
+        let memory = StableMemory(vec![region(&null_metadata_without_capacity, Access::READ)]);
+        let mut no_capacity = layout();
+        no_capacity.capacity_offset = None;
+        no_capacity.empty_policy = EmptySpanPolicy::RequireNull;
+        let span = unsafe {
+            ForeignSpan::from_direct(
+                &memory,
+                Address::new(null_metadata_without_capacity.as_ptr() as usize),
+                no_capacity,
+                Access::READ,
+            )
+            .unwrap()
+        };
+        assert!(span.is_empty());
+    }
+
+    #[test]
     fn ordering_divisibility_and_limits_are_rejected() {
         let elements = [1_u32, 2];
         let start = elements.as_ptr() as usize;
@@ -851,6 +1000,133 @@ mod tests {
     }
 
     #[test]
+    fn alignment_capacity_divisibility_and_byte_limits_are_rejected() {
+        let bytes = [0_u8; 16];
+        let start = bytes.as_ptr() as usize;
+
+        let misaligned = [start + 1, start + 5, start + 9];
+        let metadata_memory = StableMemory(vec![
+            region(&misaligned, Access::READ),
+            region(&bytes, Access::READ),
+        ]);
+        assert!(matches!(
+            unsafe {
+                ForeignSpan::from_direct(
+                    &metadata_memory,
+                    Address::new(misaligned.as_ptr() as usize),
+                    layout(),
+                    Access::READ,
+                )
+            },
+            Err(ForeignSpanError::Memory(MemoryError::Misaligned { .. }))
+        ));
+
+        let indivisible_capacity = [start, start + 4, start + 6];
+        let metadata_memory = StableMemory(vec![
+            region(&indivisible_capacity, Access::READ),
+            region(&bytes, Access::READ),
+        ]);
+        assert!(matches!(
+            unsafe {
+                ForeignSpan::from_direct(
+                    &metadata_memory,
+                    Address::new(indivisible_capacity.as_ptr() as usize),
+                    layout(),
+                    Access::READ,
+                )
+            },
+            Err(ForeignSpanError::IndivisibleCapacity { .. })
+        ));
+
+        let excessive = [1_usize, 1 + isize::MAX as usize + 1];
+        let mut byte_layout = layout();
+        byte_layout.capacity_offset = None;
+        byte_layout.element_size = 1;
+        byte_layout.element_alignment = 1;
+        byte_layout.max_elements = usize::MAX;
+        assert!(matches!(
+            unsafe {
+                ForeignSpan::from_direct(
+                    &StableMemory(vec![region(&excessive, Access::READ)]),
+                    Address::new(excessive.as_ptr() as usize),
+                    byte_layout,
+                    Access::READ,
+                )
+            },
+            Err(ForeignSpanError::ByteLengthExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn complete_range_rejects_gaps_and_permission_changes() {
+        let elements = [10_u32, 20, 30];
+        let begin = elements.as_ptr() as usize;
+        let metadata = [begin, begin + 12, begin + 12];
+        let vector = Address::new(metadata.as_ptr() as usize);
+
+        let adjacent = StableMemory(vec![
+            region(&metadata, Access::READ),
+            region_range(begin, 4, Access::READ),
+            region_range(begin + 4, 8, Access::READ),
+        ]);
+        assert!(
+            unsafe { ForeignSpan::from_direct(&adjacent, vector, layout(), Access::READ) }.is_ok()
+        );
+
+        let gap = StableMemory(vec![
+            region(&metadata, Access::READ),
+            region_range(begin, 4, Access::READ),
+            region_range(begin + 8, 4, Access::READ),
+        ]);
+        assert!(matches!(
+            unsafe { ForeignSpan::from_direct(&gap, vector, layout(), Access::READ) },
+            Err(ForeignSpanError::Memory(MemoryError::Unmapped { .. }))
+        ));
+
+        let read_only = StableMemory(vec![
+            region(&metadata, Access::READ),
+            region(&elements, Access::READ),
+        ]);
+        assert!(matches!(
+            unsafe {
+                ForeignSpan::from_direct(&read_only, vector, layout(), Access::READ | Access::WRITE)
+            },
+            Err(ForeignSpanError::Memory(
+                MemoryError::PermissionDenied { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn access_rechecks_mapping_after_construction() {
+        let elements = [10_u32, 20, 30];
+        let begin = elements.as_ptr() as usize;
+        let metadata = [begin, begin + 12, begin + 12];
+        let memory = DynamicMemory(RwLock::new(vec![
+            region(&metadata, Access::READ),
+            region(&elements, Access::READ),
+        ]));
+        unsafe {
+            super::super::with_direct_memory_scope(&memory, |scope| {
+                let span = ForeignSpan::from_scope(
+                    scope,
+                    Address::new(metadata.as_ptr() as usize),
+                    layout(),
+                    Access::READ,
+                )
+                .unwrap();
+                memory.0.write().unwrap()[1].access = Access::empty();
+                assert!(matches!(
+                    span.read_scoped::<u32, _>(scope, 0),
+                    Err(ForeignSpanError::Memory(
+                        MemoryError::PermissionDenied { .. }
+                    ))
+                ));
+            })
+        }
+    }
+
+    #[test]
     fn write_access_and_exact_bulk_length_are_enforced() {
         let mut elements = [10_u32, 20, 30];
         let begin = elements.as_mut_ptr() as usize;
@@ -875,6 +1151,25 @@ mod tests {
         ));
         unsafe { span.write_direct(&memory, 1, &77_u32).unwrap() };
         assert_eq!(elements[1], 77);
+
+        let replacement = [1_u32, 2, 3];
+        unsafe {
+            span.write_all_direct(&memory, bytemuck::cast_slice(&replacement))
+                .unwrap()
+        };
+        assert_eq!(elements, replacement);
+
+        let partial = PartialWriteMemory {
+            inner: StableMemory(vec![region(&elements, Access::READ | Access::WRITE)]),
+            bytes_written: 5,
+        };
+        assert_eq!(
+            unsafe { span.write_all_direct(&partial, &[0; 12]) },
+            Err(ForeignSpanError::Memory(MemoryError::PartialWrite {
+                expected: 12,
+                actual: 5,
+            }))
+        );
     }
 
     #[test]
@@ -898,5 +1193,66 @@ mod tests {
             })
         }
         assert_eq!(elements[0], 99);
+    }
+
+    #[test]
+    fn shared_and_empty_slice_capabilities_are_validated() {
+        let elements = [10_u32, 20, 30];
+        let begin = elements.as_ptr() as usize;
+        let metadata = [begin, begin + 12, begin + 12];
+        let memory = StableMemory(vec![
+            region(&metadata, Access::READ),
+            region(&elements, Access::READ),
+        ]);
+        unsafe {
+            super::super::with_direct_memory_scope(&memory, |scope| {
+                let span = ForeignSpan::from_scope(
+                    scope,
+                    Address::new(metadata.as_ptr() as usize),
+                    layout(),
+                    Access::READ,
+                )
+                .unwrap();
+                let slice = span.foreign_slice::<u32, _>(scope).unwrap();
+                assert_eq!(&*slice, &elements);
+            })
+        }
+
+        let empty_metadata = [0_usize; 3];
+        let empty_memory = StableMemory(vec![region(&empty_metadata, Access::READ)]);
+        unsafe {
+            super::super::with_direct_memory_scope(&empty_memory, |scope| {
+                let span = ForeignSpan::from_scope(
+                    scope,
+                    Address::new(empty_metadata.as_ptr() as usize),
+                    layout(),
+                    Access::READ,
+                )
+                .unwrap();
+                let empty = span.foreign_slice::<u32, _>(scope).unwrap();
+                assert!(empty.is_empty());
+                assert!(!empty.as_ptr().is_null());
+            })
+        }
+    }
+
+    #[test]
+    fn unreadable_metadata_identifies_the_field() {
+        let metadata = [0_usize; 3];
+        let memory = StableMemory(vec![region(&metadata, Access::empty())]);
+        assert!(matches!(
+            unsafe {
+                ForeignSpan::from_direct(
+                    &memory,
+                    Address::new(metadata.as_ptr() as usize),
+                    layout(),
+                    Access::READ,
+                )
+            },
+            Err(ForeignSpanError::Metadata {
+                field: "begin",
+                source: MemoryError::PermissionDenied { .. }
+            })
+        ));
     }
 }
