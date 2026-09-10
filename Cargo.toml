@@ -28,7 +28,7 @@ cranelift-module = "0.119"
 cranelift-jit = "0.119"
 
 [dev-dependencies]
-proptest = "1"
+proptest = "=1.10.0"
 toml = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
