@@ -815,6 +815,12 @@ pub mod testing;
 pub mod read;
 pub use read::{DirectMemoryReadExt, FaultContainedMemoryReadExt, ReadError, ReadLimits};
 
+pub mod chain;
+pub use chain::{
+    Assertion, ChainError, ChainLimits, ChainOperation, ChainStep, ChainValue, ChainValueKind,
+    PointerChain,
+};
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
