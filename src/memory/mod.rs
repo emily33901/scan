@@ -480,6 +480,50 @@ impl ProcessMemory {
     pub const fn new() -> Self {
         Self { _private: () }
     }
+
+    /// Establishes the stability contract for checked direct operations once.
+    ///
+    /// # Safety
+    ///
+    /// Every range used by `operation`, including dynamically derived ranges,
+    /// must remain allocated, mapped, permitted, initialized where read, valid
+    /// for raw access, and correctly synchronized from its final preflight
+    /// through its copy. Values borrowing the fresh scope cannot escape.
+    pub unsafe fn with_scope<R>(
+        &self,
+        operation: impl for<'scope> FnOnce(&mut DirectMemoryScope<'scope, Self>) -> R,
+    ) -> R {
+        // SAFETY: delegated to this method's caller.
+        unsafe { with_direct_memory_scope(self, operation) }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+impl MemoryMap for ProcessMemory {
+    fn region_containing(&self, _address: Address) -> Result<MemoryRegion, MemoryError> {
+        Err(MemoryError::UnsupportedPlatform {
+            operation: PlatformOperation::Query,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+impl DirectMemoryAccess for ProcessMemory {
+    unsafe fn read_bytes_into(
+        &self,
+        _address: Address,
+        _output: &mut [u8],
+    ) -> Result<(), MemoryError> {
+        Err(MemoryError::UnsupportedPlatform {
+            operation: PlatformOperation::Read,
+        })
+    }
+
+    unsafe fn write_bytes_from(&self, _address: Address, _bytes: &[u8]) -> Result<(), MemoryError> {
+        Err(MemoryError::UnsupportedPlatform {
+            operation: PlatformOperation::Write,
+        })
+    }
 }
 
 /// Runs a direct operation in a fresh, invariant, non-thread-transferable scope.
@@ -761,6 +805,12 @@ impl<T: ?Sized> DerefMut for ForeignMut<'_, T> {
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
+
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(all(target_os = "windows", feature = "fault-contained"))]
+pub use windows::FaultContainedProcessMemory;
 
 #[cfg(test)]
 mod tests {
