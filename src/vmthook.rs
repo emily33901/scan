@@ -130,7 +130,7 @@ pub enum HookError {
         #[source]
         source: crate::memory::MemoryError,
     },
-    #[error("vtable discovery failed")]
+    #[error("vtable discovery failed: {0}")]
     VTable(#[source] VTableError),
     #[error("original function in slot {slot} at {address} failed revalidation")]
     Function {
@@ -1099,6 +1099,9 @@ mod tests {
                 address,
                 ..
             }) if *address == Address::new(1)
+        ));
+        assert!(error.to_string().starts_with(
+            "vtable discovery failed: vtable entry 1 at 0x1 failed executable validation"
         ));
         let source = std::error::Error::source(&error).unwrap();
         let discovery = source.downcast_ref::<VTableError>().unwrap();
