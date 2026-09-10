@@ -172,6 +172,7 @@ impl MemoryMap for FaultContainedProcessMemory {
 #[cfg(feature = "fault-contained")]
 unsafe impl super::FaultContainedMemoryAccess for FaultContainedProcessMemory {
     fn try_read_bytes_into(&self, address: Address, output: &mut [u8]) -> Result<(), MemoryError> {
+        super::reject_read_overlap(address, output)?;
         let range = address.checked_range(output.len())?;
         self.check_range(range, Access::READ, DEFAULT_MAX_REGIONS)?;
         let source =

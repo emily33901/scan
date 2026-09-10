@@ -282,6 +282,22 @@ pub fn validate_alignment(alignment: usize) -> Result<(), MemoryError> {
     }
 }
 
+fn reject_read_overlap(address: Address, output: &mut [u8]) -> Result<(), MemoryError> {
+    if output.is_empty() {
+        return Err(MemoryError::ZeroLength);
+    }
+    let source_range = address.checked_range(output.len())?;
+    let destination = Address::new(output.as_mut_ptr() as usize).checked_range(output.len())?;
+    if source_range.overlaps(destination) {
+        Err(MemoryError::OverlappingRanges {
+            source_range,
+            destination,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// Supplies point-in-time mapping information for current-process addresses.
 pub trait MemoryMap: Send + Sync {
     fn region_containing(&self, address: Address) -> Result<MemoryRegion, MemoryError>;
@@ -572,17 +588,7 @@ impl<'scope, M: DirectMemoryAccess + ?Sized> DirectMemoryScope<'scope, M> {
 
     /// Copies bytes under the contract established when this scope was made.
     pub fn read_bytes_into(&self, address: Address, output: &mut [u8]) -> Result<(), MemoryError> {
-        if output.is_empty() {
-            return Err(MemoryError::ZeroLength);
-        }
-        let source_range = address.checked_range(output.len())?;
-        let destination = Address::new(output.as_mut_ptr() as usize).checked_range(output.len())?;
-        if source_range.overlaps(destination) {
-            return Err(MemoryError::OverlappingRanges {
-                source_range,
-                destination,
-            });
-        }
+        reject_read_overlap(address, output)?;
         // SAFETY: creation of the scope established the backend preconditions;
         // overlap with the Rust output borrow was rejected above.
         unsafe { self.memory.read_bytes_into(address, output) }
@@ -805,6 +811,9 @@ impl<T: ?Sized> DerefMut for ForeignMut<'_, T> {
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
+
+pub mod read;
+pub use read::{DirectMemoryReadExt, FaultContainedMemoryReadExt, ReadError, ReadLimits};
 
 #[cfg(target_os = "macos")]
 mod macos;

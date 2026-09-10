@@ -151,6 +151,7 @@ unsafe impl super::FaultContainedMemoryAccess for FaultContainedProcessMemory {
         use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
         use windows::Win32::System::Threading::GetCurrentProcess;
 
+        super::reject_read_overlap(address, output)?;
         let range = address.checked_range(output.len())?;
         self.check_range(range, Access::READ, DEFAULT_MAX_REGIONS)?;
         let mut transferred = 0_usize;
@@ -292,5 +293,11 @@ mod tests {
         assert!(memory
             .try_read_bytes_into(Address::new(1), &mut output)
             .is_err());
+
+        let overlap = Address::new(output.as_ptr() as usize);
+        assert!(matches!(
+            memory.try_read_bytes_into(overlap, &mut output),
+            Err(MemoryError::OverlappingRanges { .. })
+        ));
     }
 }

@@ -406,6 +406,7 @@ impl DirectMemoryAccess for FakeMemory {
 // SAFETY: every operation is a checked copy into owned storage.
 unsafe impl FaultContainedMemoryAccess for FakeMemory {
     fn try_read_bytes_into(&self, address: Address, output: &mut [u8]) -> Result<(), MemoryError> {
+        super::reject_read_overlap(address, output)?;
         self.read(address, output)
     }
     unsafe fn try_write_bytes_from(
