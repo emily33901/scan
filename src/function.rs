@@ -13,8 +13,9 @@ use thiserror::Error;
 
 use crate::memory::{
     Access, Address, AddressRange, DirectMemoryAccess, DirectMemoryScope,
-    FaultContainedMemoryAccess, MemoryError, MemoryMap, ModuleId, RegionKind,
+    FaultContainedMemoryAccess, MemoryError, MemoryMap, ModuleId,
 };
+use crate::module::{LoadedModule, Section};
 
 /// Alignment required for an instruction address on the current target.
 ///
@@ -36,15 +37,120 @@ pub enum ExecutablePolicy {
     /// Permit any currently executable mapping, including private JIT memory.
     #[default]
     AnyExecutable,
-    /// Require an executable mapping classified as an image by the platform.
-    Image,
-    /// Require the currently mapped region to belong to this module snapshot.
-    Module(ModuleId),
-    /// Require a selected module and a validated executable-section range.
-    ExecutableSection {
-        module: ModuleId,
-        range: AddressRange,
-    },
+    /// Require an address proven to be in a selected image snapshot.
+    Image(ModuleAddressPolicy),
+    /// Require an address proven to be in a selected module snapshot.
+    Module(ModuleAddressPolicy),
+    /// Require membership in a section proven to belong to parsed module
+    /// metadata. The opaque proof cannot be assembled from an arbitrary range.
+    ExecutableSection(ExecutableSectionPolicy),
+}
+
+impl ExecutablePolicy {
+    /// Builds an image-membership policy for one address from copied, parsed
+    /// module metadata.
+    pub fn for_image(module: &LoadedModule, address: Address) -> Result<Self, FunctionError> {
+        Ok(Self::Image(ModuleAddressPolicy::new(module, address)?))
+    }
+
+    /// Builds a module-membership policy for one address from copied, parsed
+    /// module metadata.
+    pub fn for_module(module: &LoadedModule, address: Address) -> Result<Self, FunctionError> {
+        Ok(Self::Module(ModuleAddressPolicy::new(module, address)?))
+    }
+
+    /// Builds a policy from an executable section in parsed module metadata.
+    ///
+    /// `section` must be an element of `module.sections`, not merely a caller-
+    /// supplied value with equal fields. The returned policy owns only copied
+    /// snapshot identity and must still be revalidated at use time.
+    pub fn for_executable_section(
+        module: &LoadedModule,
+        section: &Section,
+        address: Address,
+    ) -> Result<Self, FunctionError> {
+        let belongs_to_module = module
+            .sections
+            .iter()
+            .any(|candidate| std::ptr::eq(candidate, section));
+        if !belongs_to_module || !module.contains_range(section.range) {
+            return Err(FunctionError::SectionNotInModule {
+                module: module.id,
+                range: section.range,
+            });
+        }
+        if !section.is_executable() {
+            return Err(FunctionError::SectionNotExecutable {
+                module: module.id,
+                range: section.range,
+            });
+        }
+        if !section.range.contains(address) {
+            return Err(FunctionError::AddressOutsideSection {
+                address,
+                module: module.id,
+                range: section.range,
+            });
+        }
+        Ok(Self::ExecutableSection(ExecutableSectionPolicy {
+            module: module.id,
+            range: section.range,
+            address,
+        }))
+    }
+}
+
+/// Opaque proof that one address belonged to a copied module snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModuleAddressPolicy {
+    module: ModuleId,
+    address: Address,
+}
+
+impl ModuleAddressPolicy {
+    fn new(module: &LoadedModule, address: Address) -> Result<Self, FunctionError> {
+        if !module.contains_address(address) {
+            return Err(FunctionError::AddressOutsideModule {
+                address,
+                module: module.id,
+            });
+        }
+        Ok(Self {
+            module: module.id,
+            address,
+        })
+    }
+
+    pub const fn module(self) -> ModuleId {
+        self.module
+    }
+
+    pub const fn address(self) -> Address {
+        self.address
+    }
+}
+
+/// Opaque proof that a range came from an executable section in parsed module
+/// metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutableSectionPolicy {
+    module: ModuleId,
+    range: AddressRange,
+    address: Address,
+}
+
+impl ExecutableSectionPolicy {
+    pub const fn module(self) -> ModuleId {
+        self.module
+    }
+
+    pub const fn range(self) -> AddressRange {
+        self.range
+    }
+
+    pub const fn address(self) -> Address {
+        self.address
+    }
 }
 
 /// An address that satisfied an executable policy when last validated.
@@ -173,25 +279,29 @@ fn validate(
 
     match policy {
         ExecutablePolicy::AnyExecutable => Ok(()),
-        ExecutablePolicy::Image if region.kind == RegionKind::Image => Ok(()),
-        ExecutablePolicy::Image => Err(FunctionError::ImageRequired { address }),
-        ExecutablePolicy::Module(expected) if region.module == Some(expected) => Ok(()),
-        ExecutablePolicy::Module(expected) => Err(FunctionError::ModuleMismatch {
-            address,
-            expected,
-            actual: region.module,
-        }),
-        ExecutablePolicy::ExecutableSection { module, range }
-            if region.module == Some(module) && range.contains(address) =>
+        ExecutablePolicy::Image(proof) | ExecutablePolicy::Module(proof)
+            if proof.address == address =>
         {
             Ok(())
         }
-        ExecutablePolicy::ExecutableSection { module, range } => {
+        ExecutablePolicy::Image(proof) | ExecutablePolicy::Module(proof) => {
+            Err(FunctionError::PolicyAddressMismatch {
+                address,
+                authorized: proof.address,
+                module: proof.module,
+            })
+        }
+        ExecutablePolicy::ExecutableSection(section)
+            if section.address == address && section.range.contains(address) =>
+        {
+            Ok(())
+        }
+        ExecutablePolicy::ExecutableSection(section) => {
             Err(FunctionError::ExecutableSectionMismatch {
                 address,
-                expected_module: module,
-                actual_module: region.module,
-                range,
+                expected_module: section.module,
+                range: section.range,
+                authorized: section.address,
             })
         }
     }
@@ -223,16 +333,10 @@ impl<Signature> FunctionAddress<Signature> {
         self.executable.address()
     }
 
-    /// Returns a typed raw pointer after the caller establishes use-time
-    /// validity.
-    ///
-    /// # Safety
-    ///
-    /// The address must have been revalidated immediately before this call and
-    /// must remain executable for the use of the returned pointer. `Signature`
-    /// must describe the intended function's exact ABI and signature.
-    pub unsafe fn as_ptr(self) -> *const Signature {
-        self.address().get() as *const Signature
+    /// Returns the untyped code address without making an extra-indirection or
+    /// callable-signature claim.
+    pub fn as_code_ptr(self) -> *const () {
+        self.address().get() as *const ()
     }
 
     /// Converts the address into a function-pointer value.
@@ -330,21 +434,39 @@ pub enum FunctionError {
         #[source]
         source: MemoryError,
     },
-    #[error("address {address} is executable but is not in an image mapping")]
-    ImageRequired { address: Address },
-    #[error("address {address} belongs to module {actual:?}, not expected module {expected:?}")]
-    ModuleMismatch {
+    #[error("address {address} was not in copied module snapshot {module:?}")]
+    AddressOutsideModule { address: Address, module: ModuleId },
+    #[error("address {address} is outside section {range:?} of module {module:?}")]
+    AddressOutsideSection {
         address: Address,
-        expected: ModuleId,
-        actual: Option<ModuleId>,
+        module: ModuleId,
+        range: AddressRange,
     },
     #[error(
-        "address {address} is outside executable section {range:?} of module {expected_module:?}; current module is {actual_module:?}"
+        "policy for module {module:?} authorizes address {authorized}, not requested address {address}"
+    )]
+    PolicyAddressMismatch {
+        address: Address,
+        authorized: Address,
+        module: ModuleId,
+    },
+    #[error(
+        "executable-section policy for module {expected_module:?} authorizes {authorized} in {range:?}, not requested address {address}"
     )]
     ExecutableSectionMismatch {
         address: Address,
         expected_module: ModuleId,
-        actual_module: Option<ModuleId>,
+        range: AddressRange,
+        authorized: Address,
+    },
+    #[error("range {range:?} is not the selected section of module {module:?}")]
+    SectionNotInModule {
+        module: ModuleId,
+        range: AddressRange,
+    },
+    #[error("section {range:?} of module {module:?} is not executable")]
+    SectionNotExecutable {
+        module: ModuleId,
         range: AddressRange,
     },
     #[error("vtable byte offset {offset} is not divisible by pointer width {pointer_width}")]
@@ -365,7 +487,9 @@ pub enum FunctionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{MemoryRegion, PlatformOperation};
+    use crate::memory::{MemoryRegion, PlatformOperation, RegionKind};
+    use crate::module::{ImageFormat, SectionKind};
+    use std::path::PathBuf;
 
     #[derive(Clone, Copy)]
     struct TestMemory {
@@ -437,6 +561,23 @@ mod tests {
         }
     }
 
+    fn parsed_module(module: ModuleId) -> LoadedModule {
+        let image = AddressRange::new(Address::new(0x1_0000), 0x1000).unwrap();
+        LoadedModule {
+            id: module,
+            path: PathBuf::from("fixture"),
+            image,
+            mapped_ranges: vec![image],
+            format: ImageFormat::Pe,
+            sections: vec![Section {
+                name: ".text".to_owned(),
+                range: AddressRange::new(Address::new(0x1_0080), 0x100).unwrap(),
+                access: Access::READ | Access::EXECUTE,
+                kind: SectionKind::Code,
+            }],
+        }
+    }
+
     #[test]
     fn default_policy_accepts_private_executable_memory() {
         let memory = memory(Access::READ | Access::EXECUTE, RegionKind::Private, None);
@@ -479,34 +620,59 @@ mod tests {
     #[test]
     fn stricter_policies_check_current_region_metadata() {
         let module = ModuleId(7);
-        let memory = memory(Access::EXECUTE, RegionKind::Image, Some(module));
+        let parsed = parsed_module(module);
         let address = Address::new(0x1_0100);
-        assert!(
-            ExecutableAddress::from_fault_contained(&memory, address, ExecutablePolicy::Image)
-                .is_ok()
-        );
-        assert!(ExecutableAddress::from_fault_contained(
-            &memory,
-            address,
-            ExecutablePolicy::Module(module)
-        )
-        .is_ok());
-        assert!(ExecutableAddress::from_fault_contained(
-            &memory,
-            address,
-            ExecutablePolicy::ExecutableSection {
-                module,
-                range: AddressRange::new(Address::new(0x1_0080), 0x100).unwrap(),
-            }
-        )
-        .is_ok());
+        let image_policy = ExecutablePolicy::for_image(&parsed, address).unwrap();
+        let module_policy = ExecutablePolicy::for_module(&parsed, address).unwrap();
+        let section_policy =
+            ExecutablePolicy::for_executable_section(&parsed, &parsed.sections[0], address)
+                .unwrap();
+        // Production mapping backends do not need to synthesize module IDs or
+        // classify mappings as images for copied module proof to remain useful.
+        let memory = memory(Access::EXECUTE, RegionKind::Shared, None);
+        assert!(ExecutableAddress::from_fault_contained(&memory, address, image_policy).is_ok());
+        assert!(ExecutableAddress::from_fault_contained(&memory, address, module_policy).is_ok());
+        assert!(ExecutableAddress::from_fault_contained(&memory, address, section_policy).is_ok());
 
-        let wrong = ExecutableAddress::from_fault_contained(
-            &memory,
-            address,
-            ExecutablePolicy::Module(ModuleId(8)),
-        );
-        assert!(matches!(wrong, Err(FunctionError::ModuleMismatch { .. })));
+        let wrong_address = Address::new(0x1_0110);
+        let wrong = ExecutableAddress::from_fault_contained(&memory, wrong_address, module_policy);
+        assert!(matches!(
+            wrong,
+            Err(FunctionError::PolicyAddressMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn arbitrary_private_range_cannot_be_mislabeled_as_a_module_section() {
+        let module = ModuleId(7);
+        let parsed = parsed_module(module);
+        let copied_section = parsed.sections[0].clone();
+        assert!(matches!(
+            ExecutablePolicy::for_executable_section(
+                &parsed,
+                &copied_section,
+                Address::new(0x1_0100)
+            ),
+            Err(FunctionError::SectionNotInModule { .. })
+        ));
+
+        let jit_address = Address::new(0x2_0100);
+        assert!(matches!(
+            ExecutablePolicy::for_module(&parsed, jit_address),
+            Err(FunctionError::AddressOutsideModule { .. })
+        ));
+
+        let section_address = Address::new(0x1_0100);
+        let policy =
+            ExecutablePolicy::for_executable_section(&parsed, &parsed.sections[0], section_address)
+                .unwrap();
+        let production_shaped = memory(Access::EXECUTE, RegionKind::Private, None);
+        assert!(ExecutableAddress::from_fault_contained(
+            &production_shaped,
+            section_address,
+            policy
+        )
+        .is_ok());
     }
 
     #[test]
@@ -567,5 +733,6 @@ mod tests {
         .unwrap();
         let function = FunctionAddress::<Callback>::new(executable);
         assert_eq!(function.address(), Address::new(0x1_0100));
+        assert_eq!(function.as_code_ptr().addr(), 0x1_0100);
     }
 }
