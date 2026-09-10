@@ -821,6 +821,9 @@ pub use chain::{
     PointerChain,
 };
 
+pub mod span;
+pub use span::{EmptySpanPolicy, ForeignSpan, ForeignSpanError, ForeignVectorLayout, SpanError};
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
