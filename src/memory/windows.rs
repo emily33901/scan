@@ -52,6 +52,8 @@ impl DirectMemoryAccess for ProcessMemory {
 }
 
 fn query_region(address: Address) -> Result<MemoryRegion, MemoryError> {
+    // SAFETY: `MEMORY_BASIC_INFORMATION` is a plain FFI output structure for
+    // which the all-zero bit pattern is valid before `VirtualQuery` fills it.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
     // SAFETY: `info` is valid output storage of the size supplied. VirtualQuery
     // inspects the numeric address without dereferencing it in Rust.
@@ -146,6 +148,8 @@ impl MemoryMap for FaultContainedProcessMemory {
 }
 
 #[cfg(feature = "fault-contained")]
+// SAFETY: every trait operation delegates the potentially faulting transfer to
+// ReadProcessMemory or WriteProcessMemory after validating the entire range.
 unsafe impl super::FaultContainedMemoryAccess for FaultContainedProcessMemory {
     fn try_read_bytes_into(&self, address: Address, output: &mut [u8]) -> Result<(), MemoryError> {
         use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -258,6 +262,7 @@ mod tests {
         let value = 0x0102_0304_u32;
         let address = Address::new(&value as *const u32 as usize);
         let mut output = [0_u8; size_of::<u32>()];
+        // SAFETY: `value` remains live and readable throughout the copy.
         unsafe {
             ProcessMemory::new()
                 .read_bytes_into(address, &mut output)
@@ -270,6 +275,8 @@ mod tests {
     fn direct_backend_writes_a_stable_value() {
         let mut value = 3_u32;
         let address = Address::new(&mut value as *mut u32 as usize);
+        // SAFETY: `value` remains live and exclusively accessible throughout
+        // the write, and every byte pattern is valid for `u32`.
         unsafe {
             ProcessMemory::new()
                 .write_bytes_from(address, &9_u32.to_ne_bytes())

@@ -199,11 +199,17 @@ macro_rules! impl_func {
                         $($Args: Copy + 'static,)*
                         TClosure: Fn(&TThis, $($Args,)*) + Send + Sync + 'static,
                     {
+                        // SAFETY: every generated trampoline embeds the stable address of its
+                        // boxed dispatch context, and the hook owner keeps that box alive while
+                        // the trampoline can be installed or executing.
                         let context = unsafe { &*context };
                         increment_saturated(&context.state.invocations);
                         if context.state.run_state.load(Ordering::Acquire) != DispatchState::ENABLED {
                             increment_saturated(&context.state.bypasses);
                             context.state.last_status.store(context.state.inactive_status() as u8, Ordering::Relaxed);
+                            // SAFETY: `original_fn` was constructed from the executable vtable
+                            // entry for this exact advertised ABI, and the trampoline forwards
+                            // the receiver and arguments unchanged.
                             return unsafe { (context.original_fn)(this, $($args,)*) };
                         }
                         if context.state.busy.compare_exchange(
@@ -211,6 +217,9 @@ macro_rules! impl_func {
                         ).is_err() {
                             increment_saturated(&context.state.bypasses);
                             context.state.last_status.store(HookStatus::BusyBypass as u8, Ordering::Relaxed);
+                            // SAFETY: `original_fn` was constructed from the executable vtable
+                            // entry for this exact advertised ABI, and the trampoline forwards
+                            // the receiver and arguments unchanged.
                             return unsafe { (context.original_fn)(this, $($args,)*) };
                         }
 
@@ -219,12 +228,18 @@ macro_rules! impl_func {
                         if context.state.run_state.load(Ordering::Acquire) != DispatchState::ENABLED {
                             increment_saturated(&context.state.bypasses);
                             context.state.last_status.store(context.state.inactive_status() as u8, Ordering::Relaxed);
+                            // SAFETY: `original_fn` was constructed from the executable vtable
+                            // entry for this exact advertised ABI, and the trampoline forwards
+                            // the receiver and arguments unchanged.
                             return unsafe { (context.original_fn)(this, $($args,)*) };
                         }
                         context.state.last_status.store(HookStatus::Running as u8, Ordering::Relaxed);
                         // DEFERRED(vmthook): expose a raw receiver before supporting concurrent
                         // handlers; `&TThis` relies on the current exclusive, non-mutating contract.
                         let handler_result = catch_unwind(AssertUnwindSafe(|| {
+                            // SAFETY: the hooked ABI requires `this` to designate a live `TThis`
+                            // for the duration of the call. The busy guard admits only one handler,
+                            // and the handler contract permits shared, non-mutating access only.
                             (context.handler)(unsafe { &*this }, $($args,)*);
                         }));
                         if let Err(payload) = handler_result {
@@ -239,6 +254,9 @@ macro_rules! impl_func {
                         }
 
                         // The pre-hook cannot suppress or duplicate the captured original call.
+                        // SAFETY: `original_fn` was constructed from the executable vtable entry
+                        // for this exact advertised ABI, and the trampoline forwards the receiver
+                        // and arguments unchanged.
                         unsafe { (context.original_fn)(this, $($args,)*) }
                     }
 
@@ -290,6 +308,8 @@ macro_rules! impl_func {
                 ) -> Box<dyn DispatchControl> {
                     Box::new([<_DispatchContext $($Args )*>] {
                         state: DispatchState::new(hook_id),
+                        // SAFETY: the caller guarantees that `original` is an executable function
+                        // with the generated `extern "C"` signature for `TRet`, `TThis`, and Args.
                         original_fn: unsafe {
                             std::mem::transmute::<
                                 *const (),

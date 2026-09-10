@@ -5,6 +5,9 @@
 //! valid Rust value. See [`memory`] for the direct and fault-contained access
 //! contracts.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(not(test), deny(clippy::undocumented_unsafe_blocks))]
+
 pub mod function;
 pub mod memory;
 pub mod method;

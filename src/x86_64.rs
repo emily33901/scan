@@ -26,6 +26,8 @@ pub struct RttiCompleteObjectLocator {
 // SAFETY: six 32-bit integer fields have no padding and every bit pattern is
 // valid for the corresponding signed or unsigned integer.
 unsafe impl bytemuck::Zeroable for RttiCompleteObjectLocator {}
+// SAFETY: `RttiCompleteObjectLocator` has a stable C layout composed solely of
+// `Zeroable`/`Pod` integer fields, has no padding, and accepts every bit pattern.
 unsafe impl bytemuck::Pod for RttiCompleteObjectLocator {}
 
 /// Copied fixed-size prefix of an MSVC `TypeDescriptor`.
@@ -38,6 +40,8 @@ pub struct TypeDescriptorHeader {
 
 // SAFETY: the two-field C layout has no padding and every bit pattern is valid.
 unsafe impl bytemuck::Zeroable for TypeDescriptorHeader {}
+// SAFETY: `TypeDescriptorHeader` has a stable C layout composed solely of
+// `Zeroable`/`Pod` `usize` fields, has no padding, and accepts every bit pattern.
 unsafe impl bytemuck::Pod for TypeDescriptorHeader {}
 
 /// Owned result of resolving MSVC x64 RTTI from an object.
@@ -333,9 +337,17 @@ pub unsafe fn read_type_info_direct<M: DirectMemoryAccess + ?Sized>(
         module,
         instance,
         limits,
+        // SAFETY: the caller guarantees the direct-copy contract for every
+        // RTTI address visited during this resolution.
         |address| unsafe { memory.read_address(address) },
+        // SAFETY: the caller guarantees the direct-copy contract for every
+        // RTTI address visited during this resolution.
         |address| unsafe { memory.read_value(address) },
+        // SAFETY: the caller guarantees the direct-copy contract for every
+        // RTTI address visited during this resolution.
         |address| unsafe { memory.read_value(address) },
+        // SAFETY: the caller guarantees the direct-copy contract for every
+        // RTTI address visited during this bounded string copy.
         |address, max_len, read_limits| unsafe {
             memory.read_c_string_bytes(address, max_len, read_limits)
         },

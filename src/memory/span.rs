@@ -64,10 +64,16 @@ impl ForeignSpan {
         layout: ForeignVectorLayout,
         access: Access,
     ) -> Result<Self, ForeignSpanError> {
+        // SAFETY: the caller upholds the direct-access contract for each
+        // metadata field, including the field at `begin_offset`.
         let begin = unsafe { read_pointer_direct(memory, vector, layout.begin_offset, "begin")? };
+        // SAFETY: the caller upholds the direct-access contract for each
+        // metadata field, including the field at `end_offset`.
         let end = unsafe { read_pointer_direct(memory, vector, layout.end_offset, "end")? };
         let capacity = match layout.capacity_offset {
             Some(offset) => {
+                // SAFETY: the caller upholds the direct-access contract for
+                // every configured metadata field, including capacity.
                 Some(unsafe { read_pointer_direct(memory, vector, offset, "capacity")? })
             }
             None => None,
@@ -272,6 +278,9 @@ impl ForeignSpan {
         index: usize,
     ) -> Result<T, ForeignSpanError> {
         let address = self.element_address::<T>(index, Access::READ)?;
+        // SAFETY: `element_address` proves the requested element lies within
+        // the validated readable span; the caller upholds the backend's
+        // remaining lifetime and synchronization requirements.
         unsafe { memory.read_value(address) }.map_err(ForeignSpanError::Memory)
     }
 
@@ -312,6 +321,9 @@ impl ForeignSpan {
         value: &T,
     ) -> Result<(), ForeignSpanError> {
         let address = self.element_address::<T>(index, Access::WRITE)?;
+        // SAFETY: `element_address` proves the destination lies within the
+        // validated writable span, and the caller guarantees that replacing
+        // these bytes preserves the host program's invariants.
         unsafe { memory.write_value(address, value) }.map_err(ForeignSpanError::Memory)
     }
 
@@ -328,6 +340,9 @@ impl ForeignSpan {
     ) -> Result<(), ForeignSpanError> {
         let address = self.element_address::<T>(index, Access::WRITE)?;
         let bytes = bytemuck::bytes_of(value);
+        // SAFETY: `element_address` proves the destination lies within the
+        // scope's validated writable span, and the caller guarantees that the
+        // replacement preserves the host program's invariants.
         unsafe { scope.write_bytes_from(address, bytes) }.map_err(ForeignSpanError::Memory)
     }
 
@@ -346,6 +361,9 @@ impl ForeignSpan {
         value: &T,
     ) -> Result<(), ForeignSpanError> {
         let address = self.element_address::<T>(index, Access::WRITE)?;
+        // SAFETY: `element_address` proves the destination lies within the
+        // validated writable span, and the caller guarantees that replacing
+        // these bytes preserves the host program's invariants.
         unsafe { memory.try_write_value(address, value) }.map_err(ForeignSpanError::Memory)
     }
 
@@ -363,6 +381,9 @@ impl ForeignSpan {
         if bytes.is_empty() {
             return Ok(());
         }
+        // SAFETY: `check_bulk_write` requires an exact-size transfer into the
+        // validated writable span, and the caller guarantees that replacing
+        // all element bytes preserves host invariants.
         unsafe { memory.write_bytes_from(self.begin, bytes) }.map_err(ForeignSpanError::Memory)
     }
 
@@ -380,6 +401,9 @@ impl ForeignSpan {
         if bytes.is_empty() {
             return Ok(());
         }
+        // SAFETY: `check_bulk_write` requires an exact-size transfer into the
+        // scope's validated writable span, and the caller guarantees that
+        // replacing all element bytes preserves host invariants.
         unsafe { scope.write_bytes_from(self.begin, bytes) }.map_err(ForeignSpanError::Memory)
     }
 
@@ -397,6 +421,9 @@ impl ForeignSpan {
         if bytes.is_empty() {
             return Ok(());
         }
+        // SAFETY: `check_bulk_write` requires an exact-size transfer into the
+        // validated writable span, and the caller guarantees that replacing
+        // all element bytes preserves host invariants.
         unsafe { memory.try_write_bytes_from(self.begin, bytes) }.map_err(ForeignSpanError::Memory)
     }
 
@@ -455,7 +482,9 @@ impl ForeignSpan {
         if self.is_empty() {
             NonNull::dangling()
         } else {
-            // Validation rejects null for non-empty spans.
+            // SAFETY: construction validation rejects null `begin` pointers
+            // for non-empty spans. Alignment for `T` is checked by callers
+            // before this helper is reached.
             unsafe { NonNull::new_unchecked(self.begin.get() as *mut T) }
         }
     }
@@ -561,6 +590,9 @@ unsafe fn read_pointer_direct<M: DirectMemoryAccess + ?Sized>(
     field: &'static str,
 ) -> Result<Address, ForeignSpanError> {
     let address = metadata_address(vector, offset, field)?;
+    // SAFETY: the caller guarantees that direct access to the requested
+    // metadata field is valid and synchronized; the checked address
+    // calculation above rules out arithmetic overflow.
     unsafe { memory.read_value::<usize>(address) }
         .map(Address::new)
         .map_err(|source| ForeignSpanError::Metadata { field, source })

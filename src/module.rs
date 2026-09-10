@@ -25,9 +25,9 @@ impl Module {
     /// Loads an image and acquires one loader reference.
     pub fn load(path: impl AsRef<OsStr>) -> Result<Self, ModuleError> {
         let path = PathBuf::from(path.as_ref());
-        // SAFETY: loading a library can run arbitrary initializers. That is the
-        // explicit purpose of this owning, side-effecting API.
         let library =
+            // SAFETY: loading a library can run arbitrary initializers. That is the
+            // explicit purpose of this owning, side-effecting API.
             unsafe { libloading::Library::new(&path) }.map_err(|source| ModuleError::Load {
                 path: path.clone(),
                 source,
@@ -518,6 +518,9 @@ mod platform_modules {
         entry_point: *mut c_void,
     }
 
+    // SAFETY: these declarations match the documented Win32 signatures. Each
+    // call site validates buffer extents and the provenance of process/module
+    // handles before crossing the FFI boundary.
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
@@ -650,7 +653,10 @@ mod platform_modules {
         let image = base.checked_range(information.image_size as usize)?;
         let path = module_path(process, module, index)?;
         // Detect unload/reload or handle reuse while the path was copied.
+        // SAFETY: all-zero is a valid initial representation for MODULEINFO.
         let mut final_information: ModuleInfo = unsafe { zeroed() };
+        // SAFETY: `final_information` is a correctly sized writable MODULEINFO
+        // and `module` came from enumeration of `process`.
         if unsafe {
             K32GetModuleInformation(
                 process,
@@ -749,6 +755,9 @@ mod platform_modules {
     const MAX_LOAD_COMMANDS: usize = 4_096;
     const MAX_PATH_BYTES: usize = 32_768;
 
+    // SAFETY: these declarations match dyld's public process-image query ABI.
+    // Each returned pointer is checked and its data is copied through Mach
+    // before the observation is accepted.
     unsafe extern "C" {
         fn _dyld_image_count() -> u32;
         fn _dyld_get_image_header(index: u32) -> *const c_void;
@@ -774,6 +783,8 @@ mod platform_modules {
         }
         // Detect index-table growth/shrinkage during collection. Per-image
         // identity is checked separately in `candidate`.
+        // SAFETY: dyld exposes a process-global observational image table; the
+        // result is used only to detect a concurrent table change.
         if unsafe { _dyld_image_count() } as usize != count {
             return Err(ModuleError::Platform {
                 operation: "dyld image table changed during enumeration",
@@ -808,8 +819,14 @@ mod platform_modules {
         let image = image_range(header.cast::<u8>(), slide)?;
         // A concurrent unload can shift dyld indices. Refuse to combine fields
         // from different images into one candidate.
+        // SAFETY: `dyld_index` was in range at the start of this observation;
+        // the result is compared only as an opaque identity value.
         let final_header = unsafe { _dyld_get_image_header(dyld_index) };
+        // SAFETY: same bounded dyld image-table observation as above; the
+        // pointer is compared only and is not dereferenced here.
         let final_name = unsafe { _dyld_get_image_name(dyld_index) };
+        // SAFETY: same bounded dyld image-table observation as above; the
+        // scalar result is compared with the previously observed slide.
         let final_slide = unsafe { _dyld_get_image_vmaddr_slide(dyld_index) } as i64;
         if final_header != header || final_name != name || final_slide != slide {
             return Err(ModuleError::Platform {

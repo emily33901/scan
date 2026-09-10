@@ -252,7 +252,10 @@ impl ClonedVtable {
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Instance(*mut ());
+// SAFETY: `Instance` is only an opaque address used as a registry key. Moving or
+// sharing the numeric identity does not grant access to the pointed-to object.
 unsafe impl Send for Instance {}
+// SAFETY: `Instance` is only compared and hashed; it is never dereferenced.
 unsafe impl Sync for Instance {}
 
 struct InstanceState {
@@ -303,6 +306,9 @@ impl InstanceState {
                 address,
                 source,
             })?;
+        // SAFETY: the caller guarantees that `instance` denotes a live,
+        // correctly aligned `AtomicPtr` vptr cell. The checks above establish
+        // that its full storage is currently readable and writable.
         let cell = unsafe { &*(instance as *const AtomicPtr<*const ()>) };
         let table = cell.load(Ordering::Acquire).cast_const();
         validate_pointer(table as usize, "vtable")?;
@@ -318,6 +324,8 @@ impl InstanceState {
         // Confirm up front that publication through the object's atomic vptr is
         // permitted. Discovery separately copies every foreign word into owned
         // storage before any hook state is published.
+        // SAFETY: `new` inherits the caller's live, aligned, atomic-vptr-cell
+        // contract and forwards the same instance address unchanged.
         let original_table = unsafe { Self::get_table(instance, &memory)? };
         let abi = current_abi()?;
         let spec = VTableSpec::new(
@@ -328,6 +336,8 @@ impl InstanceState {
         );
         let object = Address::new(instance as usize);
         let discovered = match options.discovery {
+            // SAFETY: the caller guarantees that the vptr, ABI prefix, and
+            // examined entries remain valid and stable for direct discovery.
             HookDiscovery::Direct => unsafe { discover_direct(&memory, object, spec) }?,
             #[cfg(all(
                 feature = "fault-contained",
@@ -392,6 +402,9 @@ impl InstanceState {
     ) -> HookResult<()> {
         // DEFERRED(vmthook): this relies on aligned pointer atomicity when foreign
         // callers load the vptr non-atomically; Rust cannot formally model that race.
+        // SAFETY: `InstanceState` is created only under the hook installation
+        // contract, which keeps this live, aligned vptr cell valid for atomic
+        // publication until restoration.
         let cell = unsafe { &*(self.instance as *const AtomicPtr<*const ()>) };
         match cell.compare_exchange(
             expected.cast_mut(),
@@ -458,7 +471,12 @@ fn registry() -> &'static Mutex<Registry> {
     })
 }
 
+// SAFETY: raw addresses in `InstanceState` refer to process-lifetime hook state
+// under the public installation contract. All mutation and foreign vptr access
+// is serialized through the registry and this state's mutex.
 unsafe impl Send for InstanceState {}
+// SAFETY: shared access to mutable state is mutex-protected, while cloned vtable
+// generations are immutable after publication and retained for process lifetime.
 unsafe impl Sync for InstanceState {}
 
 /// A hooked function in an instance's vtable.
@@ -510,6 +528,8 @@ impl HookFunction {
         index: usize,
         f: impl ThunkablePreHook<R, T, Args>,
     ) -> HookResult<Self> {
+        // SAFETY: this function imposes the same contract as the delegated
+        // configurable constructor and forwards every argument unchanged.
         unsafe { Self::new_pre_with_options(instance, index, f, HookOptions::default()) }
     }
 
@@ -555,6 +575,9 @@ impl HookFunction {
         let (instance_state, new_instance) = match registry.instances.get(&instance_key) {
             Some(state) => (Arc::clone(state), false),
             None => {
+                // SAFETY: `new_pre_with_options`'s public contract supplies the
+                // object, vptr-cell, table-lifetime, and discovery guarantees
+                // required by `InstanceState::new`.
                 let state = Arc::new(Mutex::new(unsafe {
                     InstanceState::new(instance.cast(), index, &options)?
                 }));
@@ -570,6 +593,8 @@ impl HookFunction {
         ensure_range(index, state.original_entries.len())?;
         let expected = state.latest_table();
         let memory = ProcessMemory::new();
+        // SAFETY: the public contract keeps the same object's atomic vptr cell
+        // live, aligned, mapped, and synchronized throughout installation.
         let actual = unsafe { InstanceState::get_table(instance.cast(), &memory)? };
         if actual != expected {
             return Err(HookError::VptrConflict {
@@ -577,6 +602,8 @@ impl HookFunction {
                 actual: actual as usize,
             });
         }
+        // SAFETY: the installation contract keeps each captured original
+        // function loaded and stable while hooks can dispatch through it.
         unsafe { state.original_entries[index].revalidate_direct(&memory) }.map_err(|source| {
             HookError::Function {
                 slot: index,
@@ -592,8 +619,12 @@ impl HookFunction {
         // discovered. Later installs clone only owned immutable generations.
         let mut generation = state.next_generation()?;
         let hook_id = HookId::next()?;
-        let context: Arc<dyn DispatchControl> =
-            Arc::from(unsafe { f.into_dispatch(original, hook_id) });
+        let context: Arc<dyn DispatchControl> = Arc::from(
+            // SAFETY: discovery validated `original` as the executable entry for
+            // this slot, and the generic bounds plus public ABI contract match the
+            // dispatch context that `ThunkablePreHook` constructs.
+            unsafe { f.into_dispatch(original, hook_id) },
+        );
         let trampoline = TrampolineStorage::global()
             .map_err(map_trampoline_error)?
             .make_trampoline(&*context, hook_id)
@@ -761,6 +792,8 @@ pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
     }
     let expected = state.latest_table();
     let memory = ProcessMemory::new();
+    // SAFETY: the restoration contract keeps this same object's atomic vptr
+    // cell live, aligned, mapped, and synchronized through restoration.
     let actual = unsafe { InstanceState::get_table(instance.cast(), &memory)? };
     if actual != expected {
         return Err(HookError::VptrConflict {

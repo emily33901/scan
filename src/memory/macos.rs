@@ -44,9 +44,11 @@ impl MemoryMap for ProcessMemory {
         let mut info_count = vm_region_basic_info_64::count();
         let mut object_name = MACH_PORT_NULL;
 
-        // SAFETY: all output pointers refer to initialized storage of the types
-        // and sizes required by `VM_REGION_BASIC_INFO_64`.
+        // SAFETY: obtaining the current task's send right has no Rust-side
+        // preconditions and does not borrow any Rust storage.
         let task = unsafe { mach_task_self() };
+        // SAFETY: all output pointers refer to live, correctly aligned storage
+        // of the types and sizes required by `VM_REGION_BASIC_INFO_64`.
         let result = unsafe {
             mach_vm_region(
                 task,
@@ -170,6 +172,8 @@ impl MemoryMap for FaultContainedProcessMemory {
 }
 
 #[cfg(feature = "fault-contained")]
+// SAFETY: every trait operation delegates the potentially faulting transfer to
+// a Mach VM syscall after validating the entire range.
 unsafe impl super::FaultContainedMemoryAccess for FaultContainedProcessMemory {
     fn try_read_bytes_into(&self, address: Address, output: &mut [u8]) -> Result<(), MemoryError> {
         super::reject_read_overlap(address, output)?;
