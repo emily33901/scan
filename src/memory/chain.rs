@@ -44,11 +44,43 @@ pub enum ChainStep {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Assertion {
     NonNull,
-    Aligned { alignment: usize },
-    Mapped { len: usize, access: Access },
-    InModule { module: ModuleId, len: usize },
-    Executable { len: usize },
-    UnsignedRange { min: u64, max: u64 },
+    Aligned {
+        alignment: usize,
+    },
+    Mapped {
+        len: usize,
+        access: Access,
+    },
+    InModule {
+        module: ModuleId,
+        len: usize,
+    },
+    Executable {
+        len: usize,
+        policy: ChainExecutablePolicy,
+    },
+    UnsignedRange {
+        min: u64,
+        max: u64,
+    },
+}
+
+/// Additional membership required by an executable assertion.
+///
+/// Keeping this policy in the chain layer avoids a
+/// `memory -> function -> memory` module dependency for memory-only users.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ChainExecutablePolicy {
+    /// Accept any mapping that has execute permission.
+    #[default]
+    Any,
+    /// Require every asserted byte to belong to this module.
+    Module(ModuleId),
+    /// Require module membership and containment in this executable section.
+    ExecutableSection {
+        module: ModuleId,
+        range: AddressRange,
+    },
 }
 
 /// The current value of a pointer-chain evaluation.
@@ -459,7 +491,7 @@ fn assert_value<M: MemoryMap + ?Sized>(
                 })?;
             check_module(memory, range, module, limits.max_regions, step)?;
         }
-        Assertion::Executable { len } => {
+        Assertion::Executable { len, policy } => {
             let address = require_address(value, step, ChainOperation::Assert)?;
             let range = address
                 .checked_range(len)
@@ -475,6 +507,25 @@ fn assert_value<M: MemoryMap + ?Sized>(
                     address,
                     source,
                 })?;
+            match policy {
+                ChainExecutablePolicy::Any => {}
+                ChainExecutablePolicy::Module(module) => {
+                    check_module(memory, range, module, limits.max_regions, step)?;
+                }
+                ChainExecutablePolicy::ExecutableSection {
+                    module,
+                    range: section,
+                } => {
+                    if !section.contains_range(range) {
+                        return Err(ChainError::ExecutableSectionMismatch {
+                            step,
+                            requested: range,
+                            section,
+                        });
+                    }
+                    check_module(memory, range, module, limits.max_regions, step)?;
+                }
+            }
         }
         Assertion::UnsignedRange { min, max } => {
             let actual = match value {
@@ -598,6 +649,14 @@ pub enum ChainError {
         expected: ModuleId,
         actual: Option<ModuleId>,
     },
+    #[error(
+        "pointer chain step {step} executable range {requested:?} is outside section {section:?}"
+    )]
+    ExecutableSectionMismatch {
+        step: usize,
+        requested: AddressRange,
+        section: AddressRange,
+    },
     #[error("pointer chain step {step} has invalid integer range {min}..={max}")]
     InvalidIntegerRange { step: usize, min: u64, max: u64 },
     #[error("pointer chain step {step} value {value} is outside {min}..={max}")]
@@ -612,6 +671,7 @@ pub enum ChainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::testing::{FakeMemory, FakeOperation, MutationTiming};
     use crate::memory::{MemoryRegion, RegionKind, DEFAULT_MAX_REGIONS};
 
     struct TestMemory {
@@ -665,6 +725,18 @@ mod tests {
             kind: RegionKind::Private,
             module: None,
         }
+    }
+
+    fn pointer_bytes(address: usize) -> Vec<u8> {
+        address.to_ne_bytes().to_vec()
+    }
+
+    fn read_count(memory: &FakeMemory) -> usize {
+        memory
+            .access_log()
+            .iter()
+            .filter(|entry| entry.operation == FakeOperation::Read)
+            .count()
     }
 
     #[test]
@@ -759,5 +831,317 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn rejects_null_unreadable_misaligned_and_undersized_targets() {
+        let unreadable_root = FakeMemory::new();
+        unreadable_root
+            .map(
+                Address::new(0x8000),
+                pointer_bytes(0x9000),
+                Access::empty(),
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        let dereference = [ChainStep::ReadPointer, ChainStep::ReadPointer];
+        let result = PointerChain::new(&dereference)
+            .evaluate_fault_contained(&unreadable_root, Address::new(0x8000));
+        assert!(matches!(
+            result,
+            Err(ChainError::Memory {
+                step: 0,
+                source: MemoryError::PermissionDenied { .. },
+                ..
+            })
+        ));
+        assert_eq!(read_count(&unreadable_root), 0);
+
+        let null = FakeMemory::new();
+        null.map(
+            Address::new(0x1000),
+            pointer_bytes(0),
+            Access::READ,
+            RegionKind::Private,
+            None,
+        )
+        .unwrap();
+        let result =
+            PointerChain::new(&dereference).evaluate_fault_contained(&null, Address::new(0x1000));
+        assert!(matches!(
+            result,
+            Err(ChainError::Memory {
+                step: 1,
+                source: MemoryError::NullAddress,
+                ..
+            })
+        ));
+        assert_eq!(read_count(&null), 1);
+
+        let unreadable = FakeMemory::new();
+        unreadable
+            .map(
+                Address::new(0x1000),
+                pointer_bytes(0x2000),
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        unreadable
+            .map(
+                Address::new(0x2000),
+                vec![0; size_of::<usize>()],
+                Access::empty(),
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        let result = PointerChain::new(&dereference)
+            .evaluate_fault_contained(&unreadable, Address::new(0x1000));
+        assert!(matches!(
+            result,
+            Err(ChainError::Memory {
+                step: 1,
+                source: MemoryError::PermissionDenied { .. },
+                ..
+            })
+        ));
+        assert_eq!(read_count(&unreadable), 1);
+
+        let misaligned = FakeMemory::new();
+        misaligned
+            .map(
+                Address::new(0x1000),
+                pointer_bytes(0x2001),
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        let result = PointerChain::new(&dereference)
+            .evaluate_fault_contained(&misaligned, Address::new(0x1000));
+        assert!(matches!(
+            result,
+            Err(ChainError::Memory {
+                step: 1,
+                source: MemoryError::Misaligned { .. },
+                ..
+            })
+        ));
+        assert_eq!(read_count(&misaligned), 1);
+
+        let undersized = FakeMemory::new();
+        undersized
+            .map(
+                Address::new(0x1000),
+                pointer_bytes(0x3000),
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        undersized
+            .map(
+                Address::new(0x3000),
+                [1, 2, 3, 4],
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        let read_u64 = [ChainStep::ReadPointer, ChainStep::ReadU64];
+        let result = PointerChain::new(&read_u64)
+            .evaluate_fault_contained(&undersized, Address::new(0x1000));
+        assert!(matches!(
+            result,
+            Err(ChainError::Memory {
+                step: 1,
+                source: MemoryError::Unmapped { .. },
+                ..
+            })
+        ));
+        assert_eq!(read_count(&undersized), 1);
+    }
+
+    #[test]
+    fn signed_overflow_is_terminal_before_memory_access() {
+        let memory = FakeMemory::new();
+        let steps = [ChainStep::Add(1), ChainStep::ReadU8];
+        let result =
+            PointerChain::new(&steps).evaluate_fault_contained(&memory, Address::new(usize::MAX));
+        assert!(matches!(
+            result,
+            Err(ChainError::Memory {
+                step: 0,
+                source: MemoryError::AddressOverflow,
+                ..
+            })
+        ));
+        assert!(memory.access_log().is_empty());
+    }
+
+    #[test]
+    fn scripted_mutation_is_observed_as_a_validated_read() {
+        let memory = FakeMemory::new();
+        memory
+            .map(
+                Address::new(0x1000),
+                pointer_bytes(0x2000),
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        memory
+            .map(
+                Address::new(0x2000),
+                pointer_bytes(0xdead),
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        memory
+            .mutate_on(
+                FakeOperation::Read,
+                2,
+                MutationTiming::Before,
+                Address::new(0x2000),
+                pointer_bytes(0x3000),
+            )
+            .unwrap();
+        let steps = [ChainStep::ReadPointer, ChainStep::ReadPointer];
+        assert_eq!(
+            PointerChain::new(&steps).evaluate_fault_contained(&memory, Address::new(0x1000)),
+            Ok(ChainValue::Address(Address::new(0x3000)))
+        );
+        assert_eq!(read_count(&memory), 2);
+    }
+
+    #[test]
+    fn executable_policies_and_module_assertions_are_enforced() {
+        let memory = FakeMemory::new();
+        let module = ModuleId(7);
+        memory
+            .map(
+                Address::new(0x4000),
+                [0; 16],
+                Access::READ | Access::EXECUTE,
+                RegionKind::Image,
+                Some(module),
+            )
+            .unwrap();
+        let section = AddressRange::new(Address::new(0x4000), 8).unwrap();
+
+        for policy in [
+            ChainExecutablePolicy::Any,
+            ChainExecutablePolicy::Module(module),
+            ChainExecutablePolicy::ExecutableSection {
+                module,
+                range: section,
+            },
+        ] {
+            let steps = [ChainStep::Assert(Assertion::Executable { len: 4, policy })];
+            assert_eq!(
+                PointerChain::new(&steps).evaluate_fault_contained(&memory, Address::new(0x4000)),
+                Ok(ChainValue::Address(Address::new(0x4000)))
+            );
+        }
+
+        let wrong_module = [ChainStep::Assert(Assertion::Executable {
+            len: 4,
+            policy: ChainExecutablePolicy::Module(ModuleId(8)),
+        })];
+        assert!(matches!(
+            PointerChain::new(&wrong_module)
+                .evaluate_fault_contained(&memory, Address::new(0x4000)),
+            Err(ChainError::ModuleMismatch { step: 0, .. })
+        ));
+
+        let outside_section = [ChainStep::Assert(Assertion::Executable {
+            len: 4,
+            policy: ChainExecutablePolicy::ExecutableSection {
+                module,
+                range: section,
+            },
+        })];
+        assert!(matches!(
+            PointerChain::new(&outside_section)
+                .evaluate_fault_contained(&memory, Address::new(0x4008)),
+            Err(ChainError::ExecutableSectionMismatch { step: 0, .. })
+        ));
+
+        let module_check = [ChainStep::Assert(Assertion::InModule { module, len: 8 })];
+        assert!(PointerChain::new(&module_check)
+            .evaluate_fault_contained(&memory, Address::new(0x4000))
+            .is_ok());
+    }
+
+    #[test]
+    fn terminal_type_error_prevents_all_later_reads() {
+        let memory = FakeMemory::new();
+        memory
+            .map(
+                Address::new(0x5000),
+                [17],
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        let steps = [ChainStep::ReadU8, ChainStep::ReadU8, ChainStep::ReadU8];
+        assert!(matches!(
+            PointerChain::new(&steps).evaluate_fault_contained(&memory, Address::new(0x5000)),
+            Err(ChainError::TypeMismatch { step: 1, .. })
+        ));
+        assert_eq!(read_count(&memory), 1);
+
+        let scripted = FakeMemory::new();
+        scripted
+            .map(
+                Address::new(0x6000),
+                pointer_bytes(0x7000),
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        scripted
+            .map(
+                Address::new(0x7000),
+                pointer_bytes(0x8000),
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        scripted
+            .fail_on(
+                FakeOperation::Read,
+                2,
+                MemoryError::InvalidValue {
+                    context: "scripted chain failure",
+                },
+            )
+            .unwrap();
+        let pointer_reads = [
+            ChainStep::ReadPointer,
+            ChainStep::ReadPointer,
+            ChainStep::ReadPointer,
+        ];
+        assert!(matches!(
+            PointerChain::new(&pointer_reads)
+                .evaluate_fault_contained(&scripted, Address::new(0x6000)),
+            Err(ChainError::Memory {
+                step: 1,
+                source: MemoryError::InvalidValue {
+                    context: "scripted chain failure"
+                },
+                ..
+            })
+        ));
+        assert_eq!(read_count(&scripted), 2);
     }
 }
