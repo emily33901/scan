@@ -604,7 +604,7 @@ pub struct DirectMemoryScope<'scope, M: ?Sized = ProcessMemory> {
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
-impl<'scope, M: DirectMemoryAccess + ?Sized> DirectMemoryScope<'scope, M> {
+impl<M: DirectMemoryAccess + ?Sized> DirectMemoryScope<'_, M> {
     pub const fn memory(&self) -> &M {
         self.memory
     }
@@ -670,13 +670,52 @@ impl<'scope, M: DirectMemoryAccess + ?Sized> DirectMemoryScope<'scope, M> {
     /// `isize::MAX`; it must remain readable and immovable, and all mutation,
     /// aliasing, data-race, destruction, reprotection, and unload rules of an
     /// ordinary `&T` must hold for the complete lifetime of the result.
-    pub unsafe fn foreign_ref<'a, T: Sized>(
-        &'a self,
+    pub unsafe fn foreign_ref<T: Sized>(
+        &self,
         address: Address,
-    ) -> Result<ForeignRef<'a, T>, ForeignReferenceError> {
+    ) -> Result<ForeignRef<'_, T>, ForeignReferenceError> {
         validate_foreign::<T>(self.memory, address, Access::READ)?;
         // SAFETY: the caller promises valid exposed provenance and a live T.
         let pointer = unsafe { NonNull::new_unchecked(address.get() as *mut T) };
+        Ok(ForeignRef {
+            pointer,
+            _lifetime: PhantomData,
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    /// Acquires a shared Rust-slice capability for foreign storage.
+    ///
+    /// # Safety
+    ///
+    /// The caller must establish the full allocation, initialization,
+    /// provenance, lifetime, immovability, aliasing, and synchronization
+    /// contract of an ordinary `&[T]` for `len` elements. The complete byte
+    /// range must remain readable and mapped for `'a`.
+    pub unsafe fn foreign_slice<T>(
+        &self,
+        address: Address,
+        len: usize,
+    ) -> Result<ForeignRef<'_, [T]>, ForeignReferenceError> {
+        let element_size = size_of::<T>();
+        if element_size == 0 {
+            return Err(ForeignReferenceError::ZeroSizedType);
+        }
+        let byte_len =
+            element_size
+                .checked_mul(len)
+                .ok_or(ForeignReferenceError::SizeExceeded {
+                    size: usize::MAX,
+                    limit: isize::MAX as usize,
+                })?;
+        if byte_len == 0 {
+            return Err(ForeignReferenceError::ZeroLength);
+        }
+        validate_foreign_range::<T>(self.memory, address, byte_len, Access::READ)?;
+        let pointer = std::ptr::slice_from_raw_parts_mut(address.get() as *mut T, len);
+        // SAFETY: the address is non-null and the caller establishes the
+        // complete Rust slice-reference contract documented above.
+        let pointer = unsafe { NonNull::new_unchecked(pointer) };
         Ok(ForeignRef {
             pointer,
             _lifetime: PhantomData,
@@ -692,10 +731,10 @@ impl<'scope, M: DirectMemoryAccess + ?Sized> DirectMemoryScope<'scope, M> {
     /// must have exclusive access for `'a`. Safe code may replace, move, or
     /// drop the value through `DerefMut`; each such operation must be valid for
     /// the host object. Use a copied field write if that cannot be guaranteed.
-    pub unsafe fn foreign_mut<'a, T: Sized>(
-        &'a mut self,
+    pub unsafe fn foreign_mut<T: Sized>(
+        &mut self,
         address: Address,
-    ) -> Result<ForeignMut<'a, T>, ForeignReferenceError> {
+    ) -> Result<ForeignMut<'_, T>, ForeignReferenceError> {
         validate_foreign::<T>(self.memory, address, Access::READ | Access::WRITE)?;
         // SAFETY: the caller promises valid exposed provenance and unique T.
         let pointer = unsafe { NonNull::new_unchecked(address.get() as *mut T) };
@@ -712,12 +751,21 @@ fn validate_foreign<T: Sized>(
     address: Address,
     required: Access,
 ) -> Result<(), ForeignReferenceError> {
-    if address.is_null() {
-        return Err(ForeignReferenceError::NullAddress);
-    }
     let len = size_of::<T>();
     if len == 0 {
         return Err(ForeignReferenceError::ZeroSizedType);
+    }
+    validate_foreign_range::<T>(memory, address, len, required)
+}
+
+fn validate_foreign_range<T>(
+    memory: &(impl MemoryMap + ?Sized),
+    address: Address,
+    len: usize,
+    required: Access,
+) -> Result<(), ForeignReferenceError> {
+    if address.is_null() {
+        return Err(ForeignReferenceError::NullAddress);
     }
     if len > isize::MAX as usize {
         return Err(ForeignReferenceError::SizeExceeded {
@@ -745,6 +793,8 @@ pub enum ForeignReferenceError {
     NullAddress,
     #[error("a foreign reference to a zero-sized type has no range to validate")]
     ZeroSizedType,
+    #[error("a foreign slice cannot validate an empty byte range")]
+    ZeroLength,
     #[error("foreign pointee size {size} exceeds reference limit {limit}")]
     SizeExceeded { size: usize, limit: usize },
     #[error("foreign reference validation failed")]
@@ -779,7 +829,7 @@ impl<T: ?Sized> Clone for ForeignRef<'_, T> {
     }
 }
 
-impl<'a, T: ?Sized> ForeignRef<'a, T> {
+impl<T: ?Sized> ForeignRef<'_, T> {
     pub fn as_ptr(self) -> *const T {
         self.pointer.as_ptr()
     }
@@ -818,7 +868,7 @@ pub struct ForeignMut<'a, T: ?Sized> {
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
-impl<'a, T: ?Sized> ForeignMut<'a, T> {
+impl<T: ?Sized> ForeignMut<'_, T> {
     pub fn as_ptr(&self) -> *mut T {
         self.pointer.as_ptr()
     }

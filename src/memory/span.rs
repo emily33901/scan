@@ -407,9 +407,9 @@ impl ForeignSpan {
     /// The element range must be one live allocation containing initialized,
     /// valid `T` values for `'scope`. It must remain immovable and readable,
     /// and ordinary shared-reference aliasing and synchronization rules apply.
-    pub unsafe fn foreign_slice<'a, 'scope, T, M: DirectMemoryAccess + ?Sized>(
+    pub unsafe fn foreign_slice<'a, T, M: DirectMemoryAccess + ?Sized>(
         self,
-        scope: &'a DirectMemoryScope<'scope, M>,
+        scope: &'a DirectMemoryScope<'_, M>,
     ) -> Result<ForeignRef<'a, [T]>, ForeignSpanError> {
         self.check_type::<T>()?;
         self.check_access(Access::READ)?;
@@ -433,9 +433,9 @@ impl ForeignSpan {
     /// valid `T` values for `'scope`, with exclusive access for that lifetime.
     /// Ordinary mutable-reference move, drop, and replacement operations must
     /// also be valid for the host container.
-    pub unsafe fn foreign_slice_mut<'a, 'scope, T, M: DirectMemoryAccess + ?Sized>(
+    pub unsafe fn foreign_slice_mut<'a, T, M: DirectMemoryAccess + ?Sized>(
         self,
-        scope: &'a mut DirectMemoryScope<'scope, M>,
+        scope: &'a mut DirectMemoryScope<'_, M>,
     ) -> Result<ForeignMut<'a, [T]>, ForeignSpanError> {
         self.check_type::<T>()?;
         self.check_access(Access::READ | Access::WRITE)?;
