@@ -2,23 +2,33 @@
 name = "scan"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.84"
+
+[features]
+default = []
+fault-contained = []
+test-support = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 anyhow = "1"
+bitflags = "2"
+bytemuck = "1"
 parking_lot = "0.12.1"
 libloading = "0.8.3"
 patternscan = "1.2.0"
 object = "0.33"
 serde = { version = "1", features = ["derive"] }
 paste = "1.0.15"
+thiserror = "2"
 
-cranelift = "0"
-cranelift-module = "0"
-cranelift-jit = "0"
+cranelift = "0.119"
+cranelift-module = "0.119"
+cranelift-jit = "0.119"
 
 [dev-dependencies]
+proptest = "1"
 toml = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
