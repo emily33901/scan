@@ -765,6 +765,7 @@ pub mod testing;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn checked_address_arithmetic_rejects_overflow() {
@@ -1051,5 +1052,56 @@ mod tests {
             *foreign = 6;
         }
         assert_eq!(mutable, 6);
+    }
+
+    proptest! {
+        #[test]
+        fn checked_add_matches_wide_integer_model(base: usize, offset: usize) {
+            let expected = (base as u128)
+                .checked_add(offset as u128)
+                .filter(|value| *value <= usize::MAX as u128)
+                .map(|value| value as usize);
+            let actual = Address::new(base).checked_add(offset).ok().map(Address::get);
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn checked_sub_matches_wide_integer_model(base: usize, offset: usize) {
+            let expected = (base as u128)
+                .checked_sub(offset as u128)
+                .map(|value| value as usize);
+            let actual = Address::new(base).checked_sub(offset).ok().map(Address::get);
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn checked_signed_add_matches_wide_integer_model(base: usize, offset: i64) {
+            let expected = (base as i128)
+                .checked_add(offset as i128)
+                .filter(|value| *value >= 0 && *value <= usize::MAX as i128)
+                .map(|value| value as usize);
+            let actual = Address::new(base)
+                .checked_add_signed(offset)
+                .ok()
+                .map(Address::get);
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn ranges_match_half_open_wide_model(start: usize, len in 0usize..4096, probe: usize) {
+            let expected_end = (start as u128)
+                .checked_add(len as u128)
+                .filter(|end| len != 0 && *end <= usize::MAX as u128);
+            let actual = AddressRange::new(Address::new(start), len);
+            match expected_end {
+                Some(end) => {
+                    let range = actual.expect("wide model predicted a representable range");
+                    prop_assert_eq!(range.end().get(), end as usize);
+                    let expected_contains = start <= probe && (probe as u128) < end;
+                    prop_assert_eq!(range.contains(Address::new(probe)), expected_contains);
+                }
+                None => prop_assert!(actual.is_err()),
+            }
+        }
     }
 }
