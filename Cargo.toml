@@ -19,7 +19,6 @@ parking_lot = "0.12.1"
 libloading = "0.8.3"
 patternscan = "1.2.0"
 object = "0.33"
-serde = { version = "1", features = ["derive"] }
 paste = "1.0.15"
 thiserror = "2"
 
