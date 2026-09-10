@@ -806,9 +806,13 @@ impl<T: ?Sized> DerefMut for ForeignMut<'_, T> {
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(all(target_os = "macos", feature = "fault-contained"))]
+pub use macos::FaultContainedProcessMemory;
 #[cfg(all(target_os = "windows", feature = "fault-contained"))]
 pub use windows::FaultContainedProcessMemory;
 
