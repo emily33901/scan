@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PROPTEST_CASES: ${{ github.event_name == 'schedule' && '4096' || '256' }}
+  RUST_BACKTRACE: 1
+
+jobs:
+  quality:
+    name: Rust 1.84 quality gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust 1.84
+        run: rustup toolchain install 1.84.0 --profile minimal --component clippy,rustfmt
+      - name: Check formatting
+        run: cargo +1.84.0 fmt --all -- --check
+      - name: Run Clippy
+        run: cargo +1.84.0 clippy --all-targets --all-features --locked -- -D warnings
+      - name: Test all features
+        run: cargo +1.84.0 test --all-features --locked
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +1.84.0 doc --all-features --no-deps --locked
+
+  platform:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-2025
+          - name: macOS arm64
+            runner: macos-15
+          - name: macOS x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust 1.84
+        run: rustup toolchain install 1.84.0 --profile minimal
+      - name: Report host
+        run: rustc +1.84.0 -vV
+      - name: Test default features
+        run: cargo +1.84.0 test --locked
+      - name: Test all features
+        run: cargo +1.84.0 test --all-features --locked
+
+  rosetta:
+    name: macOS x86_64 under Rosetta
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust 1.84 x86_64 target
+        run: |
+          rustup toolchain install 1.84.0 --profile minimal
+          rustup target add --toolchain 1.84.0 x86_64-apple-darwin
+      - name: Test translated x86_64 binary
+        env:
+          SCAN_REQUIRE_ROSETTA: "1"
+        run: cargo +1.84.0 test --target x86_64-apple-darwin --all-features --locked
