@@ -19,7 +19,7 @@ pub mod x86_64;
 
 mod vmthook;
 
-pub use vmthook::thunk::{AsCraneliftAbi, ThunkablePreHook};
+pub use vmthook::thunk::{AsCraneliftAbi, ThunkablePostHook, ThunkablePreHook};
 pub use vmthook::{
     restore_instance, HookDiagnostics, HookDiscovery, HookError, HookFunction, HookId, HookInfo,
     HookMemoryOperation, HookOptions, HookResult, HookStatus,

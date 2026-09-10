@@ -32,6 +32,7 @@ impl std::fmt::Display for TrampolineError {
 mod sealed {
     pub trait Abi {}
     pub trait PreHook<R, T, Args> {}
+    pub trait PostHook<R, T, Args> {}
 }
 
 #[doc(hidden)]
@@ -50,6 +51,23 @@ pub trait ThunkablePreHook<R, T, Args>:
     sealed::PreHook<R, T, Args> + Send + Sync + 'static
 where
     R: 'static,
+    T: 'static,
+    Args: 'static,
+{
+    unsafe fn into_dispatch(self, original: *const (), hook_id: HookId)
+        -> Box<dyn DispatchControl>;
+}
+
+/// Internal dispatch contract for [`crate::HookFunction::new_post`].
+///
+/// This trait is public only because it occurs in the public constructor's
+/// bounds. Implementations are sealed to closures with one of the supported
+/// hook ABIs.
+#[doc(hidden)]
+pub trait ThunkablePostHook<R, T, Args>:
+    sealed::PostHook<R, T, Args> + Send + Sync + 'static
+where
+    R: Copy + 'static,
     T: 'static,
     Args: 'static,
 {
@@ -329,6 +347,172 @@ macro_rules! impl_func {
                 $($Args: Copy + 'static + AsCraneliftAbi,)*
                 TClosure: Fn(&TThis, $($Args,)*) + Send + Sync + 'static,
             {}
+
+            struct [<_PostDispatchContext $($Args )*>]<TClosure, TRet, TThis, $($Args,)*> {
+                state: DispatchState,
+                original_fn: [<_RawFunc $($Args )*>]<TRet, TThis, $($Args,)*>,
+                handler: TClosure,
+            }
+
+            impl<TClosure, TRet, TThis, $($Args,)*> DispatchControl
+                for [<_PostDispatchContext $($Args )*>]<TClosure, TRet, TThis, $($Args,)*>
+            where
+                TRet: Copy + 'static + AsCraneliftAbi,
+                TThis: 'static,
+                $($Args: Copy + 'static + AsCraneliftAbi,)*
+                TClosure: Fn(&TThis, $($Args,)* TRet) -> TRet + Send + Sync + 'static,
+            {
+                fn context_address(&self) -> *const () {
+                    (self as *const Self).cast()
+                }
+
+                fn dispatcher_address(&self) -> *const () {
+                    unsafe extern "C" fn dispatch<TClosure, TRet, TThis, $($Args,)*>(
+                        context: *const [<_PostDispatchContext $($Args )*>]<TClosure, TRet, TThis, $($Args,)*>,
+                        this: *mut TThis,
+                        $($args: $Args,)*
+                    ) -> TRet
+                    where
+                        TRet: Copy,
+                        TThis: 'static,
+                        $($Args: Copy + 'static,)*
+                        TClosure: Fn(&TThis, $($Args,)* TRet) -> TRet + Send + Sync + 'static,
+                    {
+                        // SAFETY: every generated trampoline embeds the stable address of its
+                        // boxed dispatch context, and the hook owner keeps that box alive while
+                        // the trampoline can be installed or executing.
+                        let context = unsafe { &*context };
+                        increment_saturated(&context.state.invocations);
+                        if context.state.run_state.load(Ordering::Acquire) != DispatchState::ENABLED {
+                            increment_saturated(&context.state.bypasses);
+                            context.state.last_status.store(context.state.inactive_status() as u8, Ordering::Relaxed);
+                            // SAFETY: `original_fn` was constructed from the executable vtable
+                            // entry for this exact advertised ABI, and the trampoline forwards
+                            // the receiver and arguments unchanged.
+                            return unsafe { (context.original_fn)(this, $($args,)*) };
+                        }
+                        if context.state.busy.compare_exchange(
+                            false, true, Ordering::Acquire, Ordering::Relaxed,
+                        ).is_err() {
+                            increment_saturated(&context.state.bypasses);
+                            context.state.last_status.store(HookStatus::BusyBypass as u8, Ordering::Relaxed);
+                            // SAFETY: `original_fn` was constructed from the executable vtable
+                            // entry for this exact advertised ABI, and the trampoline forwards
+                            // the receiver and arguments unchanged.
+                            return unsafe { (context.original_fn)(this, $($args,)*) };
+                        }
+
+                        // Keep exclusivity through the original and post-transform so original-
+                        // and handler-driven reentry bypasses the handler without blocking.
+                        let _busy = BusyGuard(&context.state.busy);
+                        if context.state.run_state.load(Ordering::Acquire) != DispatchState::ENABLED {
+                            increment_saturated(&context.state.bypasses);
+                            context.state.last_status.store(context.state.inactive_status() as u8, Ordering::Relaxed);
+                            // SAFETY: `original_fn` was constructed from the executable vtable
+                            // entry for this exact advertised ABI, and the trampoline forwards
+                            // the receiver and arguments unchanged.
+                            return unsafe { (context.original_fn)(this, $($args,)*) };
+                        }
+                        context.state.last_status.store(HookStatus::Running as u8, Ordering::Relaxed);
+                        // SAFETY: `original_fn` was constructed from the executable vtable entry
+                        // for this exact advertised ABI, and the trampoline forwards the receiver
+                        // and arguments unchanged. Its return is copied so panic fallback retains
+                        // the original value while the handler receives its own copy.
+                        let original_result = unsafe { (context.original_fn)(this, $($args,)*) };
+                        // DEFERRED(vmthook): expose a raw receiver before supporting concurrent
+                        // handlers; `&TThis` relies on the current exclusive, non-mutating contract.
+                        let handler_result = catch_unwind(AssertUnwindSafe(|| {
+                            // SAFETY: the post-hook contract requires `this` to designate a live
+                            // `TThis` after the original returns. The busy guard admits only one
+                            // handler, and the handler contract permits shared, non-mutating access.
+                            (context.handler)(unsafe { &*this }, $($args,)* original_result)
+                        }));
+                        match handler_result {
+                            Ok(result) => {
+                                context.state.last_status.store(HookStatus::Ready as u8, Ordering::Relaxed);
+                                result
+                            }
+                            Err(payload) => {
+                                increment_saturated(&context.state.panics);
+                                context.state.run_state.store(DispatchState::PANICKED, Ordering::Release);
+                                context.state.last_status.store(HookStatus::Panicked as u8, Ordering::Relaxed);
+                                // A panic payload may itself panic while being dropped. Never let
+                                // that second panic cross the generated extern boundary.
+                                std::mem::forget(payload);
+                                original_result
+                            }
+                        }
+                    }
+
+                    dispatch::<TClosure, TRet, TThis, $($Args,)*> as *const ()
+                }
+
+                fn thunk_cranelift_sig(&self, module: &mut JITModule) -> Signature {
+                    let mut signature = module.make_signature();
+                    signature.returns.push(cranelift_abi::<TRet>());
+                    signature.params.push(AbiParam::new(module.target_config().pointer_type()));
+                    signature.params.push(cranelift_abi::<*mut TThis>());
+                    $(signature.params.push(cranelift_abi::<$Args>());)*
+                    signature
+                }
+
+                fn original_cranelift_sig(&self, module: &mut JITModule) -> Signature {
+                    let mut signature = module.make_signature();
+                    signature.returns.push(cranelift_abi::<TRet>());
+                    signature.params.push(cranelift_abi::<*mut TThis>());
+                    $(signature.params.push(cranelift_abi::<$Args>());)*
+                    signature
+                }
+
+                fn set_enabled(&self, enabled: bool) -> bool { self.state.set_enabled(enabled) }
+                fn retire(&self, status: HookStatus) {
+                    let run_state = if status == HookStatus::Restored {
+                        DispatchState::RESTORED
+                    } else {
+                        DispatchState::RETIRED
+                    };
+                    self.state.run_state.store(run_state, Ordering::Release);
+                    self.state.last_status.store(status as u8, Ordering::Relaxed);
+                }
+                fn diagnostics(&self) -> HookDiagnostics { self.state.diagnostics() }
+            }
+
+            impl<TClosure, TRet, TThis, $($Args,)*>
+                ThunkablePostHook<TRet, TThis, ($($Args,)*)> for TClosure
+            where
+                TRet: Copy + 'static + AsCraneliftAbi,
+                TThis: 'static,
+                $($Args: Copy + 'static + AsCraneliftAbi,)*
+                TClosure: Fn(&TThis, $($Args,)* TRet) -> TRet + Send + Sync + 'static,
+            {
+                unsafe fn into_dispatch(
+                    self,
+                    original: *const (),
+                    hook_id: HookId,
+                ) -> Box<dyn DispatchControl> {
+                    Box::new([<_PostDispatchContext $($Args )*>] {
+                        state: DispatchState::new(hook_id),
+                        // SAFETY: the caller guarantees that `original` is an executable function
+                        // with the generated `extern "C"` signature for `TRet`, `TThis`, and Args.
+                        original_fn: unsafe {
+                            std::mem::transmute::<
+                                *const (),
+                                [<_RawFunc $($Args )*>]<TRet, TThis, $($Args,)*>,
+                            >(original)
+                        },
+                        handler: self,
+                    })
+                }
+            }
+
+            impl<TClosure, TRet, TThis, $($Args,)*>
+                sealed::PostHook<TRet, TThis, ($($Args,)*)> for TClosure
+            where
+                TRet: Copy + 'static + AsCraneliftAbi,
+                TThis: 'static,
+                $($Args: Copy + 'static + AsCraneliftAbi,)*
+                TClosure: Fn(&TThis, $($Args,)* TRet) -> TRet + Send + Sync + 'static,
+            {}
         }
     };
 }
@@ -583,6 +767,13 @@ mod tests {
         unsafe { handler.into_dispatch(original as *const (), HookId(id)) }
     }
 
+    unsafe fn make_post_dispatch<F>(handler: F, id: u64) -> Box<dyn DispatchControl>
+    where
+        F: ThunkablePostHook<u32, Target, (u32,)>,
+    {
+        unsafe { handler.into_dispatch(original as *const (), HookId(id)) }
+    }
+
     unsafe fn direct_dispatch(
         dispatch: &dyn DispatchControl,
         target: *mut Target,
@@ -615,6 +806,87 @@ mod tests {
         assert_eq!(handler_calls.load(Ordering::Relaxed), 41);
         assert_eq!(target.original_calls.load(Ordering::Relaxed), 1);
         assert_eq!(dispatch.diagnostics().invocations, 1);
+    }
+
+    #[test]
+    fn post_dispatch_calls_original_then_transforms_result() {
+        let handler_calls = Arc::new(AtomicU32::new(0));
+        let observed_calls = Arc::clone(&handler_calls);
+        let dispatch = unsafe {
+            make_post_dispatch(
+                move |this: &Target, argument: u32, original_result: u32| {
+                    assert_eq!(this.original_calls.load(Ordering::Relaxed), 1);
+                    assert_eq!(argument, 41);
+                    assert_eq!(original_result, 42);
+                    observed_calls.fetch_add(1, Ordering::Relaxed);
+                    original_result + 100
+                },
+                19,
+            )
+        };
+        let mut target = Target {
+            original_calls: AtomicU32::new(0),
+        };
+
+        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 41) }, 142);
+        assert_eq!(target.original_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(dispatch.diagnostics().last_status, HookStatus::Ready);
+    }
+
+    #[test]
+    fn post_panic_returns_original_and_disables_handler() {
+        let handler_calls = Arc::new(AtomicU32::new(0));
+        let observed_calls = Arc::clone(&handler_calls);
+        let dispatch = unsafe {
+            make_post_dispatch(
+                move |_this: &Target, _argument: u32, _original_result: u32| {
+                    observed_calls.fetch_add(1, Ordering::Relaxed);
+                    panic!("expected post-hook panic");
+                },
+                20,
+            )
+        };
+        let mut target = Target {
+            original_calls: AtomicU32::new(0),
+        };
+
+        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 1) }, 2);
+        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 2) }, 3);
+
+        let diagnostics = dispatch.diagnostics();
+        assert!(!diagnostics.enabled);
+        assert_eq!(diagnostics.panics, 1);
+        assert_eq!(diagnostics.bypasses, 1);
+        assert_eq!(diagnostics.last_status, HookStatus::Panicked);
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(target.original_calls.load(Ordering::Relaxed), 2);
+        assert!(!dispatch.set_enabled(true));
+    }
+
+    #[test]
+    fn disabled_post_hook_bypasses_transform() {
+        let handler_calls = Arc::new(AtomicU32::new(0));
+        let observed_calls = Arc::clone(&handler_calls);
+        let dispatch = unsafe {
+            make_post_dispatch(
+                move |_this: &Target, _argument: u32, original_result: u32| {
+                    observed_calls.fetch_add(1, Ordering::Relaxed);
+                    original_result + 10
+                },
+                21,
+            )
+        };
+        let mut target = Target {
+            original_calls: AtomicU32::new(0),
+        };
+
+        assert!(dispatch.set_enabled(false));
+        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 1) }, 2);
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(target.original_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(dispatch.diagnostics().bypasses, 1);
+        assert_eq!(dispatch.diagnostics().last_status, HookStatus::Disabled);
     }
 
     #[test]
@@ -723,6 +995,59 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_post_entry_bypasses_without_transforming() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let handler_calls = Arc::new(AtomicU32::new(0));
+        let handler_entered = Arc::clone(&entered);
+        let handler_release = Arc::clone(&release);
+        let observed_calls = Arc::clone(&handler_calls);
+        let dispatch = unsafe {
+            make_post_dispatch(
+                move |_this: &Target, _argument: u32, original_result: u32| {
+                    observed_calls.fetch_add(1, Ordering::Relaxed);
+                    handler_entered.wait();
+                    handler_release.wait();
+                    original_result + 100
+                },
+                22,
+            )
+        };
+        let mut target = Target {
+            original_calls: AtomicU32::new(0),
+        };
+        let context_address = dispatch.context_address() as usize;
+        let dispatcher_address = dispatch.dispatcher_address() as usize;
+        let target_address = (&mut target as *mut Target) as usize;
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let dispatcher: TestDispatcher = unsafe { std::mem::transmute(dispatcher_address) };
+                assert_eq!(
+                    unsafe {
+                        dispatcher(
+                            context_address as *const (),
+                            target_address as *mut Target,
+                            10,
+                        )
+                    },
+                    111
+                );
+            });
+            entered.wait();
+            assert_eq!(
+                unsafe { direct_dispatch(&*dispatch, target_address as *mut Target, 20) },
+                21
+            );
+            release.wait();
+        });
+
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(target.original_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(dispatch.diagnostics().bypasses, 1);
+    }
+
+    #[test]
     fn nested_entry_bypasses_handler_and_calls_original() {
         let context_address = Arc::new(AtomicUsize::new(0));
         let dispatcher_address = Arc::new(AtomicUsize::new(0));
@@ -760,6 +1085,44 @@ mod tests {
     }
 
     #[test]
+    fn nested_post_entry_bypasses_transform() {
+        let context_address = Arc::new(AtomicUsize::new(0));
+        let dispatcher_address = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::new(AtomicU32::new(0));
+        let nested_result = Arc::new(AtomicU32::new(0));
+        let captured_context = Arc::clone(&context_address);
+        let captured_dispatcher = Arc::clone(&dispatcher_address);
+        let observed_calls = Arc::clone(&handler_calls);
+        let observed_result = Arc::clone(&nested_result);
+        let handler = move |this: &Target, _argument: u32, original_result: u32| {
+            observed_calls.fetch_add(1, Ordering::Relaxed);
+            let dispatcher: TestDispatcher =
+                unsafe { std::mem::transmute(captured_dispatcher.load(Ordering::Relaxed)) };
+            let result = unsafe {
+                dispatcher(
+                    captured_context.load(Ordering::Relaxed) as *const (),
+                    this as *const Target as *mut Target,
+                    40,
+                )
+            };
+            observed_result.store(result, Ordering::Relaxed);
+            original_result + 100
+        };
+        let dispatch = unsafe { make_post_dispatch(handler, 23) };
+        context_address.store(dispatch.context_address() as usize, Ordering::Relaxed);
+        dispatcher_address.store(dispatch.dispatcher_address() as usize, Ordering::Relaxed);
+        let mut target = Target {
+            original_calls: AtomicU32::new(0),
+        };
+
+        assert_eq!(unsafe { direct_dispatch(&*dispatch, &mut target, 1) }, 102);
+        assert_eq!(nested_result.load(Ordering::Relaxed), 41);
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(target.original_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(dispatch.diagnostics().bypasses, 1);
+    }
+
+    #[test]
     fn warmed_trampoline_dispatch_makes_no_framework_allocations() {
         let dispatch = unsafe { make_dispatch(|_: &Target, _: u32| {}, 18) };
         let trampoline = TrampolineStorage::global()
@@ -776,6 +1139,31 @@ mod tests {
         let (result, allocations) = allocations_during(|| unsafe { function(&mut target, 41) });
 
         assert_eq!(result, 42);
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn post_trampoline_transforms_without_framework_allocations() {
+        let dispatch = unsafe {
+            make_post_dispatch(
+                |_: &Target, _: u32, original_result: u32| original_result + 10,
+                24,
+            )
+        };
+        let trampoline = TrampolineStorage::global()
+            .unwrap()
+            .make_trampoline(&*dispatch, HookId(1_000_024))
+            .unwrap();
+        let function: unsafe extern "C" fn(*mut Target, u32) -> u32 =
+            unsafe { std::mem::transmute(trampoline) };
+        let mut target = Target {
+            original_calls: AtomicU32::new(0),
+        };
+        assert_eq!(unsafe { function(&mut target, 0) }, 11);
+
+        let (result, allocations) = allocations_during(|| unsafe { function(&mut target, 41) });
+
+        assert_eq!(result, 52);
         assert_eq!(allocations, 0);
     }
 

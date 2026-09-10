@@ -24,7 +24,9 @@ use crate::{
 };
 use parking_lot::Mutex;
 use thiserror::Error;
-use thunk::{DispatchControl, ThunkablePreHook, TrampolineError, TrampolineStorage};
+use thunk::{
+    DispatchControl, ThunkablePostHook, ThunkablePreHook, TrampolineError, TrampolineStorage,
+};
 
 static NEXT_HOOK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -533,6 +535,33 @@ impl HookFunction {
         unsafe { Self::new_pre_with_options(instance, index, f, HookOptions::default()) }
     }
 
+    /// Installs a post-transform hook which runs after the captured original.
+    ///
+    /// The original is invoked exactly once before the handler. The handler
+    /// receives its captured return value and may replace it. Its return type
+    /// must be `Copy` so a panicking handler can fall back to the original
+    /// value. Dropping the returned handle does not remove or disable the hook.
+    /// Nested and concurrent entries bypass the handler without blocking and
+    /// return the captured original result directly. A handler panic permanently
+    /// disables the handler and returns the original result.
+    ///
+    /// # Safety
+    ///
+    /// This has the same installation, object lifetime, vptr, ABI, module, and
+    /// synchronization requirements as [`Self::new_pre`]. In addition, the
+    /// receiver and any pointer or reference arguments supplied to the handler
+    /// must remain valid after the original returns. The transformed return value
+    /// must satisfy the hooked method's foreign ABI and semantic contract.
+    pub unsafe fn new_post<R: Copy + 'static, T: 'static, Args: 'static>(
+        instance: *mut T,
+        index: usize,
+        f: impl ThunkablePostHook<R, T, Args>,
+    ) -> HookResult<Self> {
+        // SAFETY: this function imposes the same contract as the delegated
+        // configurable constructor and forwards every argument unchanged.
+        unsafe { Self::new_post_with_options(instance, index, f, HookOptions::default()) }
+    }
+
     /// Installs a pre-hook with discovery and naming options.
     ///
     /// The first successful install fixes the instance's discovered table size;
@@ -562,6 +591,52 @@ impl HookFunction {
         f: impl ThunkablePreHook<R, T, Args>,
         options: HookOptions,
     ) -> HookResult<Self> {
+        let make_dispatch = |original, hook_id| {
+            // SAFETY: common installation validated `original` as the
+            // executable vtable entry for this advertised hook ABI.
+            unsafe { f.into_dispatch(original, hook_id) }
+        };
+        // SAFETY: this public constructor supplies the object, vptr-cell,
+        // table-lifetime, and ABI guarantees required by common installation.
+        unsafe { Self::new_with_options(instance, index, options, make_dispatch) }
+    }
+
+    /// Installs a post-transform hook with discovery and naming options.
+    ///
+    /// The first successful install fixes the instance's discovered table size;
+    /// `max_vtable_slots` is ignored for later slots on that instance. The
+    /// original return is passed to the handler by value and the handler's return
+    /// replaces it only when the handler completes successfully.
+    ///
+    /// # Safety
+    ///
+    /// This has the same installation requirements as
+    /// [`Self::new_pre_with_options`]. The receiver, pointer/reference arguments,
+    /// and return value also need to remain valid for the post-original handler;
+    /// the handler's replacement return must satisfy the foreign method's ABI and
+    /// semantic contract.
+    pub unsafe fn new_post_with_options<R: Copy + 'static, T: 'static, Args: 'static>(
+        instance: *mut T,
+        index: usize,
+        f: impl ThunkablePostHook<R, T, Args>,
+        options: HookOptions,
+    ) -> HookResult<Self> {
+        let make_dispatch = |original, hook_id| {
+            // SAFETY: common installation validated `original` as the
+            // executable vtable entry for this advertised hook ABI.
+            unsafe { f.into_dispatch(original, hook_id) }
+        };
+        // SAFETY: this public constructor supplies the object, vptr-cell,
+        // table-lifetime, and ABI guarantees required by common installation.
+        unsafe { Self::new_with_options(instance, index, options, make_dispatch) }
+    }
+
+    unsafe fn new_with_options<T: 'static>(
+        instance: *mut T,
+        index: usize,
+        options: HookOptions,
+        make_dispatch: impl FnOnce(*const (), HookId) -> Box<dyn DispatchControl>,
+    ) -> HookResult<Self> {
         let instance_key = Instance(instance.cast());
         let mut registry = registry().lock();
         if let Some(&existing) = registry.by_slot.get(&(instance_key, index)) {
@@ -575,9 +650,8 @@ impl HookFunction {
         let (instance_state, new_instance) = match registry.instances.get(&instance_key) {
             Some(state) => (Arc::clone(state), false),
             None => {
-                // SAFETY: `new_pre_with_options`'s public contract supplies the
-                // object, vptr-cell, table-lifetime, and discovery guarantees
-                // required by `InstanceState::new`.
+                // SAFETY: the public constructor delegates its object,
+                // vptr-cell, table-lifetime, and discovery guarantees here.
                 let state = Arc::new(Mutex::new(unsafe {
                     InstanceState::new(instance.cast(), index, &options)?
                 }));
@@ -621,9 +695,9 @@ impl HookFunction {
         let hook_id = HookId::next()?;
         let context: Arc<dyn DispatchControl> = Arc::from(
             // SAFETY: discovery validated `original` as the executable entry for
-            // this slot, and the generic bounds plus public ABI contract match the
-            // dispatch context that `ThunkablePreHook` constructs.
-            unsafe { f.into_dispatch(original, hook_id) },
+            // this slot. The public constructor's generic bounds and ABI contract
+            // govern the supplied dispatch-context factory.
+            make_dispatch(original, hook_id),
         );
         let trampoline = TrampolineStorage::global()
             .map_err(map_trampoline_error)?
@@ -950,6 +1024,29 @@ mod tests {
             HookFunction::lookup_slot(target, 1).unwrap().hook_id,
             second.id()
         );
+    }
+
+    #[test]
+    fn post_hook_transforms_captured_original_result() {
+        let target = leak_target();
+        let hook = unsafe {
+            HookFunction::new_post::<u32, _, _>(
+                target,
+                0,
+                |this: &HookTarget, value: u32, original_result: u32| {
+                    assert_eq!(this.calls.load(Ordering::Relaxed), 1);
+                    assert_eq!(value, 3);
+                    assert_eq!(original_result, 13);
+                    original_result + 100
+                },
+            )
+        }
+        .unwrap();
+
+        assert_eq!(unsafe { call_slot(target, 0, 3) }, 113);
+        assert_eq!(unsafe { &*target }.calls.load(Ordering::Relaxed), 1);
+        assert!(hook.diagnostics().enabled);
+        assert_eq!(hook.diagnostics().last_status, HookStatus::Ready);
     }
 
     #[test]
