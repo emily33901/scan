@@ -394,6 +394,24 @@ pub unsafe trait FaultContainedMemoryAccess: MemoryMap {
 pub const DEFAULT_MAX_REGIONS: usize = 1_024;
 
 /// Typed operations built on a direct-copy backend.
+///
+/// Raw direct reads cannot be called from safe code:
+///
+/// ```compile_fail
+/// use scan::memory::{Address, DirectMemoryAccessExt, ProcessMemory};
+///
+/// let memory = ProcessMemory::new();
+/// let _: u32 = memory.read_value(Address::new(1)).unwrap();
+/// ```
+///
+/// Types with invalid bit patterns are rejected at compile time:
+///
+/// ```compile_fail
+/// use scan::memory::{Address, DirectMemoryAccessExt, ProcessMemory};
+///
+/// let memory = ProcessMemory::new();
+/// let _: bool = unsafe { memory.read_value(Address::new(1)).unwrap() };
+/// ```
 pub trait DirectMemoryAccessExt: DirectMemoryAccess {
     /// Copies a value from a foreign address.
     ///
@@ -566,6 +584,20 @@ where
 }
 
 /// A non-escaping capability for checked direct access.
+///
+/// The higher-ranked scope brand prevents a foreign handle from escaping:
+///
+/// ```compile_fail
+/// use scan::memory::{Address, ForeignRef, ProcessMemory};
+///
+/// fn escape(memory: &ProcessMemory) -> ForeignRef<'static, u32> {
+///     unsafe {
+///         memory.with_scope(|scope| {
+///             scope.foreign_ref(Address::new(1)).unwrap()
+///         })
+///     }
+/// }
+/// ```
 pub struct DirectMemoryScope<'scope, M: ?Sized = ProcessMemory> {
     memory: &'scope M,
     _brand: PhantomData<fn(&'scope ()) -> &'scope ()>,
@@ -724,6 +756,15 @@ pub enum ForeignReferenceError {
 
 /// A scoped shared reference to storage whose validity was established by an
 /// unsafe constructor.
+///
+/// Foreign references are deliberately neither `Send` nor `Sync`:
+///
+/// ```compile_fail
+/// use scan::memory::ForeignRef;
+///
+/// fn require_send<T: Send>() {}
+/// require_send::<ForeignRef<'static, u32>>();
+/// ```
 pub struct ForeignRef<'a, T: ?Sized> {
     pointer: NonNull<T>,
     _lifetime: PhantomData<&'a T>,
