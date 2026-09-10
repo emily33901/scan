@@ -5,6 +5,7 @@
 //! valid Rust value. See [`memory`] for the direct and fault-contained access
 //! contracts.
 
+pub mod function;
 pub mod memory;
 pub mod method;
 
