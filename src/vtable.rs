@@ -1,8 +1,10 @@
 //! Bounded discovery of C++ virtual-function tables.
 //!
 //! Discovery copies the object vptr, ABI prefix, and every function entry into
-//! owned storage. It deliberately retains the null-terminator heuristic used by
-//! the hook layer, but constrains it to one readable mapping and a hard cap.
+//! owned storage. By default it deliberately retains the null-terminator
+//! heuristic used by the hook layer, but constrains it to one readable mapping
+//! and a hard cap. An explicit opt-in supports the MSVC layout where adjacent
+//! tables are separated by a non-executable RTTI word rather than a null.
 
 use std::mem::size_of;
 
@@ -108,6 +110,24 @@ impl From<ExecutablePolicy> for VTableExecutablePolicy<'_> {
     }
 }
 
+/// End-of-table evidence accepted while copying a vtable.
+///
+/// The default remains a null word: it is the least permissive heuristic and
+/// preserves the historical hook behavior. MSVC vtables may instead be
+/// followed by a readable RTTI pointer, which is not executable. Callers that
+/// have verified that layout may opt into the second variant; it never accepts
+/// a non-executable requested slot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum VTableTerminator {
+    /// Only a null entry terminates discovery.
+    #[default]
+    Null,
+    /// A null entry, or the first non-executable entry strictly after the
+    /// requested slot, terminates discovery.
+    NullOrNonExecutableAfterRequestedSlot,
+}
+
 /// Limits and validation policy for one discovery operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VTableSpec<'module> {
@@ -115,6 +135,7 @@ pub struct VTableSpec<'module> {
     pub slot: usize,
     pub max_slots: usize,
     pub executable_policy: VTableExecutablePolicy<'module>,
+    pub terminator: VTableTerminator,
 }
 
 impl<'module> VTableSpec<'module> {
@@ -129,7 +150,14 @@ impl<'module> VTableSpec<'module> {
             slot,
             max_slots,
             executable_policy: executable_policy.into(),
+            terminator: VTableTerminator::Null,
         }
+    }
+
+    /// Selects the evidence accepted as the end of the vtable.
+    pub const fn with_terminator(mut self, terminator: VTableTerminator) -> Self {
+        self.terminator = terminator;
+        self
     }
 }
 
@@ -474,6 +502,28 @@ fn discover<R: VTableReader + ?Sized>(
             terminated = true;
             break;
         }
+        // Check broad execute permission before applying the caller's stricter
+        // membership policy. A policy mismatch must not be mistaken for an
+        // end-of-table marker.
+        let any_executable = match reader.executable(entry, ExecutablePolicy::AnyExecutable) {
+            Ok(executable) => executable,
+            Err(source)
+                if slot > spec.slot
+                    && spec.terminator
+                        == VTableTerminator::NullOrNonExecutableAfterRequestedSlot
+                    && is_non_executable(&source) =>
+            {
+                terminated = true;
+                break;
+            }
+            Err(source) => {
+                return Err(VTableError::InvalidExecutable {
+                    slot,
+                    address: entry,
+                    source,
+                });
+            }
+        };
         let executable_policy = spec
             .executable_policy
             .for_address(entry)
@@ -482,13 +532,17 @@ fn discover<R: VTableReader + ?Sized>(
                 address: entry,
                 source,
             })?;
-        let executable = reader
-            .executable(entry, executable_policy)
-            .map_err(|source| VTableError::InvalidExecutable {
-                slot,
-                address: entry,
-                source,
-            })?;
+        let executable = if executable_policy == ExecutablePolicy::AnyExecutable {
+            any_executable
+        } else {
+            reader
+                .executable(entry, executable_policy)
+                .map_err(|source| VTableError::InvalidExecutable {
+                    slot,
+                    address: entry,
+                    source,
+                })?
+        };
         entries.push(executable);
     }
 
@@ -512,6 +566,20 @@ fn discover<R: VTableReader + ?Sized>(
         entries: entries.into_boxed_slice(),
         requested_slot: spec.slot,
     })
+}
+
+fn is_non_executable(error: &FunctionError) -> bool {
+    matches!(
+        error,
+        FunctionError::Memory {
+            source:
+                MemoryError::PermissionDenied {
+                    required,
+                    actual,
+                    ..
+                },
+        } if required.contains(Access::EXECUTE) && !actual.contains(Access::EXECUTE)
+    )
 }
 
 #[cfg(test)]
@@ -818,6 +886,105 @@ mod tests {
         assert!(matches!(
             error,
             VTableError::TerminatorLimit { max_slots: 1 }
+        ));
+    }
+
+    #[test]
+    fn opt_in_non_executable_terminator_copies_preceding_entries() {
+        let tail = 0x1000;
+        let functions = [
+            function_address(first_function),
+            function_address(second_function),
+            tail,
+        ];
+        let mut fixture = Fixture::new(CxxAbi::Msvc64, &functions, false, ModuleId(7));
+        fixture
+            .memory
+            .regions
+            .iter_mut()
+            .find(|region| region.contains(Address::new(tail)))
+            .unwrap()
+            .access = Access::READ;
+
+        let found = unsafe {
+            discover_direct(
+                &fixture.memory,
+                fixture.object,
+                fixture
+                    .spec(CxxAbi::Msvc64, 1, 8)
+                    .with_terminator(VTableTerminator::NullOrNonExecutableAfterRequestedSlot),
+            )
+            .unwrap()
+        };
+        assert_eq!(found.entries().len(), 2);
+        assert_eq!(
+            found.requested_entry().address(),
+            Address::new(functions[1])
+        );
+
+        let error = unsafe {
+            discover_direct(
+                &fixture.memory,
+                fixture.object,
+                fixture.spec(CxxAbi::Msvc64, 1, 8),
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(
+            error,
+            VTableError::InvalidExecutable { slot: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn non_executable_requested_slot_is_never_a_terminator() {
+        let tail = 0x1000;
+        let functions = [function_address(first_function), tail];
+        let mut fixture = Fixture::new(CxxAbi::Msvc64, &functions, false, ModuleId(7));
+        fixture
+            .memory
+            .regions
+            .iter_mut()
+            .find(|region| region.contains(Address::new(tail)))
+            .unwrap()
+            .access = Access::READ;
+
+        let error = unsafe {
+            discover_direct(
+                &fixture.memory,
+                fixture.object,
+                fixture
+                    .spec(CxxAbi::Msvc64, 1, 8)
+                    .with_terminator(VTableTerminator::NullOrNonExecutableAfterRequestedSlot),
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(
+            error,
+            VTableError::InvalidExecutable { slot: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn policy_mismatch_is_never_a_non_executable_terminator() {
+        let functions = [0x1000, 0x2000];
+        let fixture = Fixture::new(CxxAbi::Msvc64, &functions, true, ModuleId(7));
+        let module = loaded_module(
+            ModuleId(7),
+            AddressRange::new(Address::new(functions[0]), 1).unwrap(),
+        );
+        let spec = VTableSpec::new(
+            CxxAbi::Msvc64,
+            0,
+            8,
+            VTableExecutablePolicy::Module(&module),
+        )
+        .with_terminator(VTableTerminator::NullOrNonExecutableAfterRequestedSlot);
+
+        let error = unsafe { discover_direct(&fixture.memory, fixture.object, spec).unwrap_err() };
+        assert!(matches!(
+            error,
+            VTableError::InvalidExecutable { slot: 1, .. }
         ));
     }
 

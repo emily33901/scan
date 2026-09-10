@@ -20,7 +20,9 @@ use crate::vtable::discover_fault_contained;
 use crate::{
     function::{ExecutableAddress, ExecutablePolicy, FunctionError},
     memory::{Access, Address, MemoryMap, ProcessMemory, DEFAULT_MAX_REGIONS},
-    vtable::{discover_direct, CxxAbi, DiscoveredVTable, VTableError, VTableSpec},
+    vtable::{
+        discover_direct, CxxAbi, DiscoveredVTable, VTableError, VTableSpec, VTableTerminator,
+    },
 };
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -35,6 +37,8 @@ pub struct HookOptions {
     pub name: Option<String>,
     pub max_vtable_slots: usize,
     pub discovery: HookDiscovery,
+    /// Evidence accepted as the end of the vtable during its first copy.
+    pub vtable_terminator: VTableTerminator,
 }
 
 impl Default for HookOptions {
@@ -43,6 +47,7 @@ impl Default for HookOptions {
             name: None,
             max_vtable_slots: 4096,
             discovery: HookDiscovery::Direct,
+            vtable_terminator: VTableTerminator::Null,
         }
     }
 }
@@ -335,7 +340,8 @@ impl InstanceState {
             requested_slot,
             options.max_vtable_slots,
             ExecutablePolicy::default(),
-        );
+        )
+        .with_terminator(options.vtable_terminator);
         let object = Address::new(instance as usize);
         let discovered = match options.discovery {
             // SAFETY: the caller guarantees that the vptr, ABI prefix, and
