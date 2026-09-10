@@ -744,7 +744,7 @@ mod tests {
         let dispatch = unsafe { make_dispatch(|_: &Target, _: u32| {}, 18) };
         let trampoline = TrampolineStorage::global()
             .unwrap()
-            .make_trampoline(&*dispatch, HookId(18))
+            .make_trampoline(&*dispatch, HookId(1_000_018))
             .unwrap();
         let function: unsafe extern "C" fn(*mut Target, u32) -> u32 =
             unsafe { std::mem::transmute(trampoline) };
@@ -772,8 +772,10 @@ mod tests {
         let first = unsafe { make_dispatch(counting_handler(Arc::clone(&first_calls)), 13) };
         let second = unsafe { make_dispatch(counting_handler(Arc::clone(&second_calls)), 14) };
         let storage = TrampolineStorage::global().unwrap();
-        let first_trampoline = storage.make_trampoline(&*first, HookId(13)).unwrap();
-        let second_trampoline = storage.make_trampoline(&*second, HookId(14)).unwrap();
+        let first_trampoline = storage.make_trampoline(&*first, HookId(1_000_013)).unwrap();
+        let second_trampoline = storage
+            .make_trampoline(&*second, HookId(1_000_014))
+            .unwrap();
         let first_function: unsafe extern "C" fn(*mut Target, u32) -> u32 =
             unsafe { std::mem::transmute(first_trampoline) };
         let second_function: unsafe extern "C" fn(*mut Target, u32) -> u32 =
@@ -807,12 +809,12 @@ mod tests {
             <_ as ThunkablePreHook<i8, NarrowTarget, (i8,)>>::into_dispatch(
                 handler,
                 narrow_original as *const (),
-                HookId(16),
+                HookId(1_000_016),
             )
         };
         let trampoline = TrampolineStorage::global()
             .unwrap()
-            .make_trampoline(&*context, HookId(16))
+            .make_trampoline(&*context, HookId(1_000_016))
             .unwrap();
         let function: unsafe extern "C" fn(*mut NarrowTarget, i8) -> i8 =
             unsafe { std::mem::transmute(trampoline) };
@@ -835,12 +837,12 @@ mod tests {
                     <_ as ThunkablePreHook<$type, AbiTarget, ($type,)>>::into_dispatch(
                         handler,
                         original as *const (),
-                        HookId($id),
+                        HookId(1_000_000 + $id),
                     )
                 };
                 let trampoline = TrampolineStorage::global()
                     .unwrap()
-                    .make_trampoline(&*context, HookId($id))
+                    .make_trampoline(&*context, HookId(1_000_000 + $id))
                     .unwrap();
                 let function: unsafe extern "C" fn(*mut AbiTarget, $type) -> $type =
                     unsafe { std::mem::transmute(trampoline) };
@@ -877,12 +879,12 @@ mod tests {
             <_ as ThunkablePreHook<isize, AbiTarget, ()>>::into_dispatch(
                 zero_handler,
                 zero_original as *const (),
-                HookId(112),
+                HookId(1_000_112),
             )
         };
         let zero_trampoline = TrampolineStorage::global()
             .unwrap()
-            .make_trampoline(&*zero_context, HookId(112))
+            .make_trampoline(&*zero_context, HookId(1_000_112))
             .unwrap();
         let zero_function: unsafe extern "C" fn(*mut AbiTarget) -> isize =
             unsafe { std::mem::transmute(zero_trampoline) };
@@ -928,12 +930,12 @@ mod tests {
             >>::into_dispatch(
                 mixed_handler,
                 mixed_original as *const (),
-                HookId(113),
+                HookId(1_000_113),
             )
         };
         let mixed_trampoline = TrampolineStorage::global()
             .unwrap()
-            .make_trampoline(&*mixed_context, HookId(113))
+            .make_trampoline(&*mixed_context, HookId(1_000_113))
             .unwrap();
         type MixedFunction =
             unsafe extern "C" fn(*mut AbiTarget, u8, i16, usize, f32, *const u8) -> usize;

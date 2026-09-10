@@ -18,6 +18,6 @@ mod vmthook;
 
 pub use vmthook::thunk::{AsCraneliftAbi, ThunkablePreHook};
 pub use vmthook::{
-    restore_instance, HookDiagnostics, HookError, HookFunction, HookId, HookInfo, HookOptions,
-    HookResult, HookStatus,
+    restore_instance, HookDiagnostics, HookDiscovery, HookError, HookFunction, HookId, HookInfo,
+    HookMemoryOperation, HookOptions, HookResult, HookStatus,
 };

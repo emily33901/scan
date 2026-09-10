@@ -1,23 +1,29 @@
-mod memory;
 pub mod thunk;
 
 use std::{
     collections::HashMap,
-    error::Error,
     fmt,
     mem::{align_of, size_of},
-    ptr,
     sync::{
         atomic::{AtomicPtr, AtomicU64, Ordering},
         Arc, OnceLock,
     },
 };
 
-use memory::{
-    checked_pointer_address, ensure_executable, ensure_readable, ensure_writable, MemoryMap,
-    ProcessMemoryMap,
+#[cfg(all(
+    feature = "fault-contained",
+    any(target_os = "windows", target_os = "macos")
+))]
+use crate::memory::FaultContainedProcessMemory;
+#[cfg(feature = "fault-contained")]
+use crate::vtable::discover_fault_contained;
+use crate::{
+    function::{ExecutableAddress, ExecutablePolicy, FunctionError},
+    memory::{Access, Address, MemoryMap, ProcessMemory, DEFAULT_MAX_REGIONS},
+    vtable::{discover_direct, CxxAbi, DiscoveredVTable, VTableError, VTableSpec},
 };
 use parking_lot::Mutex;
+use thiserror::Error;
 use thunk::{DispatchControl, ThunkablePreHook, TrampolineError, TrampolineStorage};
 
 static NEXT_HOOK_ID: AtomicU64 = AtomicU64::new(1);
@@ -26,6 +32,7 @@ static NEXT_HOOK_ID: AtomicU64 = AtomicU64::new(1);
 pub struct HookOptions {
     pub name: Option<String>,
     pub max_vtable_slots: usize,
+    pub discovery: HookDiscovery,
 }
 
 impl Default for HookOptions {
@@ -33,140 +40,110 @@ impl Default for HookOptions {
         Self {
             name: None,
             max_vtable_slots: 4096,
+            discovery: HookDiscovery::Direct,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Memory-copy strategy used for the first vtable discovery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HookDiscovery {
+    /// Direct checked copies under the installer's unsafe stability contract.
+    #[default]
+    Direct,
+    /// Operating-system-mediated reads that contain invalid source addresses.
+    #[cfg(feature = "fault-contained")]
+    FaultContained,
+}
+
+/// Operation being performed on the object's atomic vptr cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookMemoryOperation {
+    ReadVptr,
+    WriteVptr,
+}
+
+#[derive(Debug, Error)]
 pub enum HookError {
-    NullPointer {
-        what: &'static str,
-    },
-    MisalignedPointer {
-        what: &'static str,
-        address: usize,
-    },
-    UnreadableObject {
-        address: usize,
-    },
-    UnwritableObject {
-        address: usize,
-    },
-    UnreadableVtable {
-        address: usize,
-    },
-    AddressOverflow {
-        what: &'static str,
-    },
-    TerminatorLimit {
-        max_slots: usize,
-    },
-    TerminatorMappingBoundary {
-        slot: usize,
-    },
-    InvalidPrefix {
-        address: usize,
-    },
-    NullOriginal {
-        slot: usize,
-    },
-    NonExecutableOriginal {
-        slot: usize,
-        address: usize,
-    },
-    SlotOutOfRange {
-        slot: usize,
-        len: usize,
-    },
+    #[error("{what} pointer is null")]
+    NullPointer { what: &'static str },
+    #[error("{what} pointer {address:#x} is not pointer-aligned")]
+    MisalignedPointer { what: &'static str, address: usize },
+    #[error("object vptr cell at {address:#x} is not readable")]
+    UnreadableObject { address: usize },
+    #[error("object vptr cell at {address:#x} is not writable")]
+    UnwritableObject { address: usize },
+    #[error("vtable memory at {address:#x} is not readable")]
+    UnreadableVtable { address: usize },
+    #[error("{what} address arithmetic overflow")]
+    AddressOverflow { what: &'static str },
+    #[error("vtable has no null terminator within the {max_slots}-slot limit")]
+    TerminatorLimit { max_slots: usize },
+    #[error("max_vtable_slots must be between 1 and {hard_limit}, got {requested}")]
+    InvalidSlotLimit { requested: usize, hard_limit: usize },
+    #[error("vtable mapping boundary reached at slot {slot} before its null terminator")]
+    TerminatorMappingBoundary { slot: usize },
+    #[error("vtable ABI prefix at {address:#x} is unreadable")]
+    InvalidPrefix { address: usize },
+    #[error("could not reserve owned storage for {requested} vtable words")]
+    VtableAllocation { requested: usize },
+    #[error("original function in slot {slot} is null")]
+    NullOriginal { slot: usize },
+    #[error("original function in slot {slot} at {address:#x} is not executable")]
+    NonExecutableOriginal { slot: usize, address: usize },
+    #[error("vtable slot {slot} is outside table length {len}")]
+    SlotOutOfRange { slot: usize, len: usize },
+    #[error(
+        "vtable slot {slot} on instance {instance:#x} is already hooked by {}",
+        existing.0
+    )]
     DuplicateHook {
         instance: usize,
         slot: usize,
         existing: HookId,
     },
-    VptrConflict {
-        expected: usize,
-        actual: usize,
-    },
+    #[error("instance vptr changed: expected {expected:#x}, found {actual:#x}")]
+    VptrConflict { expected: usize, actual: usize },
+    #[error("restored hook instances cannot currently be hooked again")]
     InstanceRestored,
-    InstanceNotManaged {
-        instance: usize,
-    },
+    #[error("instance {instance:#x} is not managed")]
+    InstanceNotManaged { instance: usize },
+    #[error("hook {} was not found", .0.0)]
     HookNotFound(HookId),
+    #[error("process hook identifier space is exhausted")]
     HookIdExhausted,
+    #[error("vtable hooking is unsupported on this target")]
     UnsupportedTarget,
+    #[error("failed to initialize trampoline JIT: {0}")]
     JitInitialization(String),
+    #[error("failed to compile trampoline: {0}")]
     JitCompilation(String),
+    #[error("failed to finalize trampoline: {0}")]
     JitFinalization(String),
+    #[error("failed to validate the object vptr for {operation:?} at {address}")]
+    Memory {
+        operation: HookMemoryOperation,
+        address: Address,
+        #[source]
+        source: crate::memory::MemoryError,
+    },
+    #[error("vtable discovery failed")]
+    VTable(#[source] VTableError),
+    #[error("original function in slot {slot} at {address} failed revalidation")]
+    Function {
+        slot: usize,
+        address: Address,
+        #[source]
+        source: FunctionError,
+    },
 }
 
-impl fmt::Display for HookError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NullPointer { what } => write!(f, "{what} pointer is null"),
-            Self::MisalignedPointer { what, address } => {
-                write!(f, "{what} pointer {address:#x} is not pointer-aligned")
-            }
-            Self::UnreadableObject { address } => {
-                write!(f, "object vptr cell at {address:#x} is not readable")
-            }
-            Self::UnwritableObject { address } => {
-                write!(f, "object vptr cell at {address:#x} is not writable")
-            }
-            Self::UnreadableVtable { address } => {
-                write!(f, "vtable memory at {address:#x} is not readable")
-            }
-            Self::AddressOverflow { what } => write!(f, "{what} address arithmetic overflow"),
-            Self::TerminatorLimit { max_slots } => write!(
-                f,
-                "vtable has no null terminator within the {max_slots}-slot limit"
-            ),
-            Self::TerminatorMappingBoundary { slot } => write!(
-                f,
-                "vtable mapping boundary reached at slot {slot} before its null terminator"
-            ),
-            Self::InvalidPrefix { address } => {
-                write!(f, "vtable ABI prefix at {address:#x} is unreadable")
-            }
-            Self::NullOriginal { slot } => write!(f, "original function in slot {slot} is null"),
-            Self::NonExecutableOriginal { slot, address } => write!(
-                f,
-                "original function in slot {slot} at {address:#x} is not executable"
-            ),
-            Self::SlotOutOfRange { slot, len } => {
-                write!(f, "vtable slot {slot} is outside table length {len}")
-            }
-            Self::DuplicateHook {
-                instance,
-                slot,
-                existing,
-            } => write!(
-                f,
-                "vtable slot {slot} on instance {instance:#x} is already hooked by {}",
-                existing.0
-            ),
-            Self::VptrConflict { expected, actual } => write!(
-                f,
-                "instance vptr changed: expected {expected:#x}, found {actual:#x}"
-            ),
-            Self::InstanceRestored => {
-                f.write_str("restored hook instances cannot currently be hooked again")
-            }
-            Self::InstanceNotManaged { instance } => {
-                write!(f, "instance {instance:#x} is not managed")
-            }
-            Self::HookNotFound(id) => write!(f, "hook {} was not found", id.0),
-            Self::HookIdExhausted => f.write_str("process hook identifier space is exhausted"),
-            Self::UnsupportedTarget => f.write_str("vtable hooking is unsupported on this target"),
-            Self::JitInitialization(message) => {
-                write!(f, "failed to initialize trampoline JIT: {message}")
-            }
-            Self::JitCompilation(message) => write!(f, "failed to compile trampoline: {message}"),
-            Self::JitFinalization(message) => write!(f, "failed to finalize trampoline: {message}"),
-        }
+impl From<VTableError> for HookError {
+    fn from(source: VTableError) -> Self {
+        Self::VTable(source)
     }
 }
-
-impl Error for HookError {}
 
 pub type HookResult<T> = std::result::Result<T, HookError>;
 
@@ -235,50 +212,8 @@ pub struct HookDiagnostics {
     pub last_status: HookStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VtableAbi {
-    #[cfg(any(all(target_os = "windows", target_env = "msvc"), test))]
-    Msvc64,
-    #[cfg(any(target_os = "macos", test))]
-    Itanium64,
-}
-
-impl VtableAbi {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]
-    fn current() -> HookResult<Self> {
-        Ok(Self::Msvc64)
-    }
-
-    #[cfg(all(
-        target_os = "macos",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    fn current() -> HookResult<Self> {
-        // DEFERRED(vmthook): arm64e pointer authentication needs validation in Ableton.
-        Ok(Self::Itanium64)
-    }
-
-    #[cfg(not(any(
-        all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"),
-        all(
-            target_os = "macos",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )
-    )))]
-    fn current() -> HookResult<Self> {
-        // DEFERRED(vmthook): add MinGW/other target ABIs only after defining and
-        // testing their vtable prefixes and method calling conventions.
-        Err(HookError::UnsupportedTarget)
-    }
-
-    const fn prefix_entries(self) -> usize {
-        match self {
-            #[cfg(any(all(target_os = "windows", target_env = "msvc"), test))]
-            Self::Msvc64 => 1,
-            #[cfg(any(target_os = "macos", test))]
-            Self::Itanium64 => 2,
-        }
-    }
+fn current_abi() -> HookResult<CxxAbi> {
+    CxxAbi::native().ok_or(HookError::UnsupportedTarget)
 }
 
 #[derive(Debug)]
@@ -288,48 +223,20 @@ struct ClonedVtable {
 }
 
 impl ClonedVtable {
-    unsafe fn copy_from<M: MemoryMap>(
-        original_table: *const *const (),
-        table_len: usize,
-        abi: VtableAbi,
-        map: &M,
-    ) -> HookResult<Self> {
-        let prefix_entries = abi.prefix_entries();
-        let mut entries = Vec::with_capacity(prefix_entries + table_len);
-        let pointer_size = size_of::<*const ()>();
-
-        for distance in (1..=prefix_entries).rev() {
-            let offset = distance
-                .checked_mul(pointer_size)
-                .ok_or(HookError::AddressOverflow {
-                    what: "vtable prefix",
-                })?;
-            let address = (original_table as usize).checked_sub(offset).ok_or(
-                HookError::AddressOverflow {
-                    what: "vtable prefix",
-                },
-            )?;
-            ensure_readable(map, address, pointer_size)
-                .map_err(|_| HookError::InvalidPrefix { address })?;
-            entries.push(unsafe { ptr::read(address as *const *const ()) });
-        }
-
-        for index in 0..table_len {
-            let address =
-                checked_pointer_address(original_table as usize, index).map_err(|_| {
-                    HookError::AddressOverflow {
-                        what: "vtable entry",
-                    }
-                })?;
-            ensure_readable(map, address, pointer_size)
-                .map_err(|_| HookError::UnreadableVtable { address })?;
-            entries.push(unsafe { ptr::read(address as *const *const ()) });
-        }
-
-        Ok(Self {
-            storage: entries.into_boxed_slice(),
+    fn from_discovered(discovered: &DiscoveredVTable) -> Self {
+        let prefix_entries = discovered.prefix().len();
+        let mut storage = Vec::with_capacity(prefix_entries + discovered.entries().len());
+        storage.extend(discovered.prefix().iter().map(|&word| word as *const ()));
+        storage.extend(
+            discovered
+                .entries()
+                .iter()
+                .map(|entry| entry.address().get() as *const ()),
+        );
+        Self {
+            storage: storage.into_boxed_slice(),
             prefix_entries,
-        })
+        }
     }
 
     fn address_point(&self) -> *const *const () {
@@ -351,8 +258,8 @@ unsafe impl Sync for Instance {}
 struct InstanceState {
     instance: *mut (),
     original_table: *const *const (),
-    table_len: usize,
-    abi: VtableAbi,
+    original_entries: Box<[ExecutableAddress]>,
+    baseline: ClonedVtable,
     generations: Vec<ClonedVtable>,
     slots: HashMap<usize, HookId>,
     restored: bool,
@@ -371,83 +278,83 @@ impl std::fmt::Debug for InstanceState {
 }
 
 impl InstanceState {
-    unsafe fn count_funcs<M: MemoryMap>(
-        table: *const *const (),
-        max_slots: usize,
-        map: &M,
-    ) -> HookResult<usize> {
-        let base = table as usize;
-        let region = map
-            .region_containing(base)
-            .map_err(|_| HookError::UnreadableVtable { address: base })?;
-        if !region.readable || !region.contains(base, size_of::<*const ()>()) {
-            return Err(HookError::UnreadableVtable { address: base });
-        }
-        // DEFERRED(vmthook): exact C++ vtable lengths are ABI- and class-specific.
-        // Keep the observed null-terminator heuristic, but constrain it to one mapping
-        // and a hard slot cap so an unfamiliar table fails closed.
-        for index in 0..max_slots {
-            let address =
-                checked_pointer_address(base, index).map_err(|_| HookError::AddressOverflow {
-                    what: "vtable entry",
-                })?;
-            if !region.contains(address, size_of::<*const ()>()) {
-                return Err(HookError::TerminatorMappingBoundary { slot: index });
-            }
-            if unsafe { ptr::read(address as *const *const ()) }.is_null() {
-                return Ok(index);
-            }
-        }
-        Err(HookError::TerminatorLimit { max_slots })
-    }
-
-    unsafe fn get_table<M: MemoryMap>(
+    unsafe fn get_table<M: MemoryMap + ?Sized>(
         instance: *const (),
         map: &M,
     ) -> HookResult<*const *const ()> {
         validate_pointer(instance as usize, "instance")?;
-        ensure_readable(map, instance as usize, size_of::<*const *const ()>()).map_err(|_| {
-            HookError::UnreadableObject {
-                address: instance as usize,
-            }
-        })?;
-        ensure_writable(map, instance as usize, size_of::<*const *const ()>()).map_err(|_| {
-            HookError::UnwritableObject {
-                address: instance as usize,
-            }
-        })?;
+        let address = Address::new(instance as usize);
+        let range = address
+            .checked_range(size_of::<*const *const ()>())
+            .map_err(|source| HookError::Memory {
+                operation: HookMemoryOperation::ReadVptr,
+                address,
+                source,
+            })?;
+        map.check_range(range, Access::READ, DEFAULT_MAX_REGIONS)
+            .map_err(|source| HookError::Memory {
+                operation: HookMemoryOperation::ReadVptr,
+                address,
+                source,
+            })?;
+        map.check_range(range, Access::WRITE, DEFAULT_MAX_REGIONS)
+            .map_err(|source| HookError::Memory {
+                operation: HookMemoryOperation::WriteVptr,
+                address,
+                source,
+            })?;
         let cell = unsafe { &*(instance as *const AtomicPtr<*const ()>) };
         let table = cell.load(Ordering::Acquire).cast_const();
         validate_pointer(table as usize, "vtable")?;
         Ok(table)
     }
 
-    fn new(instance: *mut (), max_slots: usize) -> HookResult<Self> {
-        let map = ProcessMemoryMap;
-        let original_table = unsafe { Self::get_table(instance, &map)? };
-        let table_len = unsafe { Self::count_funcs(original_table, max_slots, &map)? };
-        for slot in 0..table_len {
-            let address = checked_pointer_address(original_table as usize, slot).map_err(|_| {
-                HookError::AddressOverflow {
-                    what: "vtable entry",
-                }
-            })?;
-            let original = unsafe { ptr::read(address as *const *const ()) };
-            if original.is_null() {
-                return Err(HookError::NullOriginal { slot });
+    unsafe fn new(
+        instance: *mut (),
+        requested_slot: usize,
+        options: &HookOptions,
+    ) -> HookResult<Self> {
+        let memory = ProcessMemory::new();
+        // Confirm up front that publication through the object's atomic vptr is
+        // permitted. Discovery separately copies every foreign word into owned
+        // storage before any hook state is published.
+        let original_table = unsafe { Self::get_table(instance, &memory)? };
+        let abi = current_abi()?;
+        let spec = VTableSpec::new(
+            abi,
+            requested_slot,
+            options.max_vtable_slots,
+            ExecutablePolicy::default(),
+        );
+        let object = Address::new(instance as usize);
+        let discovered = match options.discovery {
+            HookDiscovery::Direct => unsafe { discover_direct(&memory, object, spec) }?,
+            #[cfg(all(
+                feature = "fault-contained",
+                any(target_os = "windows", target_os = "macos")
+            ))]
+            HookDiscovery::FaultContained => {
+                discover_fault_contained(&FaultContainedProcessMemory::new(), object, spec)?
             }
-            ensure_executable(&map, original as usize).map_err(|_| {
-                HookError::NonExecutableOriginal {
-                    slot,
-                    address: original as usize,
-                }
-            })?;
+            #[cfg(all(
+                feature = "fault-contained",
+                not(any(target_os = "windows", target_os = "macos"))
+            ))]
+            HookDiscovery::FaultContained => return Err(HookError::UnsupportedTarget),
+        };
+        if discovered.address_point().get() != original_table as usize {
+            return Err(HookError::VptrConflict {
+                expected: original_table as usize,
+                actual: discovered.address_point().get(),
+            });
         }
+        let original_entries = discovered.entries().to_vec().into_boxed_slice();
+        let baseline = ClonedVtable::from_discovered(&discovered);
         Ok(Self {
             original_table,
             instance,
-            table_len,
-            abi: VtableAbi::current()?,
+            original_entries,
+            baseline,
             generations: Vec::new(),
             slots: HashMap::new(),
             restored: false,
@@ -461,8 +368,7 @@ impl InstanceState {
     }
 
     fn original_function(&self, index: usize) -> *const () {
-        // SAFETY: installation validates index against the discovered baseline.
-        unsafe { *self.original_table.add(index) }
+        self.original_entries[index].address().get() as *const ()
     }
 
     fn next_generation(&self) -> HookResult<ClonedVtable> {
@@ -472,14 +378,10 @@ impl InstanceState {
                 prefix_entries: current.prefix_entries,
             })
         } else {
-            unsafe {
-                ClonedVtable::copy_from(
-                    self.original_table,
-                    self.table_len,
-                    self.abi,
-                    &ProcessMemoryMap,
-                )
-            }
+            Ok(ClonedVtable {
+                storage: self.baseline.storage.clone(),
+                prefix_entries: self.baseline.prefix_entries,
+            })
         }
     }
 
@@ -584,11 +486,18 @@ impl HookFunction {
     ///
     /// # Safety
     ///
-    /// `instance` must identify a live object with a compatible C++ vtable and
-    /// remain alive while hooked. The original module must remain loaded. The
-    /// callback's shared reference assumes foreign code does not mutate the object
-    /// incompatibly while it runs. On Itanium targets, the class must not require
-    /// vcall or vbase offsets before the copied offset-to-top and typeinfo words.
+    /// `instance` must be non-null, pointer-aligned, and identify a live object
+    /// whose first word is layout- and alignment-compatible with
+    /// `AtomicPtr<*const ()>`. That vptr cell must stay mapped, readable,
+    /// writable, and correctly synchronized through discovery and publication,
+    /// and the object must remain alive while hooked. The original vtable ABI
+    /// prefix and all examined entries must remain allocated, readable,
+    /// initialized, and unchanged until the default direct discovery completes.
+    /// The original module and every captured function must remain loaded and
+    /// executable while the hook can dispatch. The callback's shared reference
+    /// assumes foreign code does not mutate the object incompatibly while it
+    /// runs. On Itanium targets, the class must not require vcall or vbase
+    /// offsets before the copied offset-to-top and typeinfo words.
     ///
     /// DEFERRED(vmthook): replace `&T` with an honest raw-pointer API before
     /// permitting concurrent or reentrant handlers.
@@ -608,9 +517,21 @@ impl HookFunction {
     /// `max_vtable_slots` is ignored for later slots on that instance.
     ///
     /// # Safety
-    /// `instance` must identify a live compatible C++ object for the process
-    /// lifetime, its original module must remain loaded, and foreign mutation
-    /// must not violate the shared callback reference's aliasing requirements.
+    ///
+    /// `instance` must be non-null, pointer-aligned, and point to a live object
+    /// whose first word is layout- and alignment-compatible with
+    /// `AtomicPtr<*const ()>`. The vptr cell must remain mapped, readable,
+    /// writable, protection-stable, and synchronized through each checked load
+    /// and compare-exchange. The object, original module, and captured functions
+    /// must remain live for as long as dispatch is possible.
+    ///
+    /// With [`HookDiscovery::Direct`], the vptr, selected ABI prefix, and every
+    /// examined table word must additionally remain allocated, readable,
+    /// initialized, synchronized, and unchanged until discovery has copied them.
+    /// Fault-contained discovery removes the raw table-copy validity requirement,
+    /// but not the atomic vptr-cell, ABI, function-lifetime, or callback aliasing
+    /// requirements. Foreign mutation must not violate the callback's shared
+    /// reference requirements.
     pub unsafe fn new_pre_with_options<R: 'static, T: 'static, Args: 'static>(
         instance: *mut T,
         index: usize,
@@ -630,10 +551,9 @@ impl HookFunction {
         let (instance_state, new_instance) = match registry.instances.get(&instance_key) {
             Some(state) => (Arc::clone(state), false),
             None => {
-                let state = Arc::new(Mutex::new(InstanceState::new(
-                    instance.cast(),
-                    options.max_vtable_slots,
-                )?));
+                let state = Arc::new(Mutex::new(unsafe {
+                    InstanceState::new(instance.cast(), index, &options)?
+                }));
                 (state, true)
             }
         };
@@ -643,26 +563,29 @@ impl HookFunction {
             // defining how foreign vptr changes establish a new baseline.
             return Err(HookError::InstanceRestored);
         }
-        ensure_range(index, state.table_len)?;
+        ensure_range(index, state.original_entries.len())?;
         let expected = state.latest_table();
-        let actual = unsafe { InstanceState::get_table(instance.cast(), &ProcessMemoryMap)? };
+        let memory = ProcessMemory::new();
+        let actual = unsafe { InstanceState::get_table(instance.cast(), &memory)? };
         if actual != expected {
             return Err(HookError::VptrConflict {
                 expected: expected as usize,
                 actual: actual as usize,
             });
         }
+        unsafe { state.original_entries[index].revalidate_direct(&memory) }.map_err(|source| {
+            HookError::Function {
+                slot: index,
+                address: state.original_entries[index].address(),
+                source,
+            }
+        })?;
         let original = state.original_function(index);
         if original.is_null() {
             return Err(HookError::NullOriginal { slot: index });
         }
-        ensure_executable(&ProcessMemoryMap, original as usize).map_err(|_| {
-            HookError::NonExecutableOriginal {
-                slot: index,
-                address: original as usize,
-            }
-        })?;
-        // Complete every fallible table read before emitting unreachable JIT code.
+        // Every foreign table read was completed when this instance was first
+        // discovered. Later installs clone only owned immutable generations.
         let mut generation = state.next_generation()?;
         let hook_id = HookId::next()?;
         let context: Arc<dyn DispatchControl> =
@@ -808,7 +731,12 @@ impl HookRecord {
 /// A vptr conflict leaves foreign state untouched and handlers disabled.
 ///
 /// # Safety
-/// The object must still be live and host calls must be quiescent for restoration.
+/// `instance` must still identify the same live, pointer-aligned object whose
+/// first word is layout- and alignment-compatible with `AtomicPtr<*const ()>`.
+/// The vptr cell must remain mapped, readable, writable, protection-stable, and
+/// correctly synchronized through validation and compare-exchange. Host calls
+/// must be quiescent for restoration; the object, original table, and captured
+/// functions must remain live until no thread can execute an old generation.
 pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
     let key = Instance(instance.cast());
     let registry = registry().lock();
@@ -828,6 +756,14 @@ pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
         }
     }
     let expected = state.latest_table();
+    let memory = ProcessMemory::new();
+    let actual = unsafe { InstanceState::get_table(instance.cast(), &memory)? };
+    if actual != expected {
+        return Err(HookError::VptrConflict {
+            expected: expected as usize,
+            actual: actual as usize,
+        });
+    }
     state.compare_exchange_vptr(expected, state.original_table)?;
     for id in state.slots.values() {
         if let Some(record) = registry.by_id.get(id) {
@@ -843,85 +779,7 @@ pub unsafe fn restore_instance<T>(instance: *mut T) -> HookResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{bail, Result};
-    use memory::MemoryRegion;
-    use std::sync::atomic::AtomicU32;
-
-    struct TableMap {
-        region: MemoryRegion,
-    }
-
-    impl MemoryMap for TableMap {
-        fn region_containing(&self, address: usize) -> Result<MemoryRegion> {
-            if (self.region.start..self.region.end).contains(&address) {
-                Ok(self.region)
-            } else {
-                bail!("mapping boundary reached")
-            }
-        }
-    }
-
-    fn map_for(entries: &[*const ()], mapped_entries: usize) -> TableMap {
-        let start = entries.as_ptr() as usize;
-        TableMap {
-            region: MemoryRegion {
-                start,
-                end: start + mapped_entries * size_of::<*const ()>(),
-                readable: true,
-                writable: true,
-                executable: false,
-            },
-        }
-    }
-
-    unsafe fn clone_layout(
-        layout: &[*const ()],
-        prefix_entries: usize,
-        abi: VtableAbi,
-    ) -> ClonedVtable {
-        let map = map_for(layout, layout.len());
-        let address_point = unsafe { layout.as_ptr().add(prefix_entries) };
-        let table_len = layout.len() - prefix_entries - 1;
-        unsafe { ClonedVtable::copy_from(address_point, table_len, abi, &map) }.unwrap()
-    }
-
-    #[test]
-    fn discovers_null_terminated_table() {
-        let entries = [
-            ptr::without_provenance(1),
-            ptr::without_provenance(2),
-            ptr::null(),
-        ];
-        let map = map_for(&entries, entries.len());
-
-        let count = unsafe { InstanceState::count_funcs(entries.as_ptr(), 8, &map) }.unwrap();
-
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn rejects_table_without_terminator_before_cap() {
-        let entries = [ptr::without_provenance(1), ptr::without_provenance(2)];
-        let map = map_for(&entries, entries.len());
-
-        let error = unsafe { InstanceState::count_funcs(entries.as_ptr(), 2, &map) }.unwrap_err();
-
-        assert_eq!(error, HookError::TerminatorLimit { max_slots: 2 });
-    }
-
-    #[test]
-    fn rejects_mapping_boundary_before_terminator() {
-        let entries = [
-            ptr::without_provenance(1),
-            ptr::without_provenance(2),
-            ptr::null(),
-        ];
-        let map = map_for(&entries, 2);
-
-        let error = unsafe { InstanceState::count_funcs(entries.as_ptr(), 3, &map) }.unwrap_err();
-
-        assert_eq!(error, HookError::TerminatorMappingBoundary { slot: 2 });
-    }
+    use std::{ptr, sync::atomic::AtomicU32};
 
     #[test]
     fn rejects_slot_at_or_beyond_table_length() {
@@ -932,110 +790,33 @@ mod tests {
 
     #[test]
     fn rejects_null_and_misaligned_pointers() {
-        assert_eq!(
+        assert!(matches!(
             validate_pointer(0, "test"),
             Err(HookError::NullPointer { what: "test" })
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             validate_pointer(1, "test"),
             Err(HookError::MisalignedPointer {
                 what: "test",
                 address: 1
             })
-        );
+        ));
     }
 
     #[test]
-    fn rejects_unwritable_object_vptr_cell() {
-        let table = [ptr::null::<()>()];
-        let object_vptr = table.as_ptr();
-        let address = &object_vptr as *const _ as usize;
-        let map = TableMap {
-            region: MemoryRegion {
-                start: address,
-                end: address + size_of::<*const *const ()>(),
-                readable: true,
-                writable: false,
-                executable: false,
-            },
-        };
+    fn vptr_validation_preserves_the_memory_error_source() {
+        let address = usize::MAX - (usize::MAX % align_of::<*const ()>());
+        let memory = ProcessMemory::new();
+        let error = unsafe { InstanceState::get_table(address as *const (), &memory) }.unwrap_err();
 
-        let object = (&object_vptr as *const *const *const ()).cast::<()>();
-        let error = unsafe { InstanceState::get_table(object, &map) }.unwrap_err();
-        assert_eq!(error, HookError::UnwritableObject { address });
-    }
-
-    #[test]
-    fn preserves_msvc_prefix_and_function_entries() {
-        let layout = [
-            0x101usize as *const (),
-            0x201usize as *const (),
-            0x301usize as *const (),
-            ptr::null(),
-        ];
-
-        let clone = unsafe { clone_layout(&layout, 1, VtableAbi::Msvc64) };
-
-        assert_eq!(&*clone.storage, &layout[..layout.len() - 1]);
-        assert_eq!(clone.address_point(), unsafe {
-            clone.storage.as_ptr().add(1)
-        });
-        assert_eq!(unsafe { *clone.address_point() }, layout[1]);
-    }
-
-    #[test]
-    fn preserves_itanium_prefix_and_function_entries() {
-        let layout = [
-            (-16isize) as *const (),
-            0x102usize as *const (),
-            0x202usize as *const (),
-            0x302usize as *const (),
-            ptr::null(),
-        ];
-
-        let clone = unsafe { clone_layout(&layout, 2, VtableAbi::Itanium64) };
-
-        assert_eq!(&*clone.storage, &layout[..layout.len() - 1]);
-        assert_eq!(clone.address_point(), unsafe {
-            clone.storage.as_ptr().add(2)
-        });
-        assert_eq!(unsafe { *clone.address_point() }, layout[2]);
-    }
-
-    #[test]
-    fn replacement_vptr_targets_function_entry_zero() {
-        let layout = [
-            0x103usize as *const (),
-            0x203usize as *const (),
-            ptr::null(),
-        ];
-        let clone = unsafe { clone_layout(&layout, 1, VtableAbi::Msvc64) };
-        let mut object_vptr = layout.as_ptr().wrapping_add(1);
-
-        let cell = unsafe {
-            &*((&mut object_vptr as *mut *const *const ()).cast::<AtomicPtr<*const ()>>())
-        };
-        cell.store(clone.address_point().cast_mut(), Ordering::Release);
-
-        assert_eq!(object_vptr, clone.address_point());
-        assert_eq!(unsafe { *object_vptr }, layout[1]);
-    }
-
-    #[test]
-    fn rejects_unreadable_vtable_prefix() {
-        let layout = [
-            0x104usize as *const (),
-            0x204usize as *const (),
-            ptr::null(),
-        ];
-        let function_entries = &layout[1..];
-        let map = map_for(function_entries, function_entries.len());
-
-        let error =
-            unsafe { ClonedVtable::copy_from(layout.as_ptr().add(1), 1, VtableAbi::Msvc64, &map) }
-                .unwrap_err();
-
-        assert!(matches!(error, HookError::InvalidPrefix { .. }));
+        assert!(matches!(
+            error,
+            HookError::Memory {
+                operation: HookMemoryOperation::ReadVptr,
+                source: crate::memory::MemoryError::AddressOverflow,
+                ..
+            }
+        ));
     }
 
     #[repr(C)]
@@ -1054,8 +835,13 @@ mod tests {
         value + 20
     }
 
+    unsafe extern "C" fn replacement_one(this: *mut HookTarget, value: u32) -> u32 {
+        unsafe { &*this }.calls.fetch_add(1, Ordering::Relaxed);
+        value + 30
+    }
+
     fn leak_target() -> *mut HookTarget {
-        let prefix = VtableAbi::current().unwrap().prefix_entries();
+        let prefix = current_abi().unwrap().prefix_words();
         let mut layout = vec![ptr::null(); prefix];
         layout.extend([
             original_zero as *const (),
@@ -1071,7 +857,7 @@ mod tests {
     }
 
     fn leak_target_with_nonexecutable_second_slot() -> *mut HookTarget {
-        let prefix = VtableAbi::current().unwrap().prefix_entries();
+        let prefix = current_abi().unwrap().prefix_words();
         let mut layout = vec![ptr::null(); prefix];
         layout.extend([
             original_zero as *const (),
@@ -1130,6 +916,29 @@ mod tests {
     }
 
     #[test]
+    fn later_installs_use_the_owned_discovery_snapshot() {
+        let target = leak_target();
+        let original_table = unsafe { (*target).vptr };
+        let _first =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
+                .unwrap();
+
+        // The original table is foreign writable storage in this fixture. A
+        // later install must not use this changed word as its captured original.
+        unsafe {
+            original_table
+                .cast_mut()
+                .add(1)
+                .write(replacement_one as *const ())
+        };
+        let _second =
+            unsafe { HookFunction::new_pre::<u32, _, _>(target, 1, |_: &HookTarget, _: u32| {}) }
+                .unwrap();
+
+        assert_eq!(unsafe { call_slot(target, 1, 2) }, 22);
+    }
+
+    #[test]
     fn duplicate_slot_is_rejected() {
         let target = leak_target();
         let _hook =
@@ -1150,12 +959,40 @@ mod tests {
             unsafe { HookFunction::new_pre::<u32, _, _>(target, 0, |_: &HookTarget, _: u32| {}) }
                 .unwrap_err();
         assert!(matches!(
-            error,
-            HookError::NonExecutableOriginal {
+            &error,
+            HookError::VTable(VTableError::InvalidExecutable {
                 slot: 1,
-                address: 1
-            }
+                address,
+                ..
+            }) if *address == Address::new(1)
         ));
+        let source = std::error::Error::source(&error).unwrap();
+        let discovery = source.downcast_ref::<VTableError>().unwrap();
+        assert!(std::error::Error::source(discovery)
+            .unwrap()
+            .downcast_ref::<FunctionError>()
+            .is_some());
+    }
+
+    #[cfg(feature = "fault-contained")]
+    #[test]
+    fn fault_contained_discovery_can_install_a_hook() {
+        let target = leak_target();
+        let hook = unsafe {
+            HookFunction::new_pre_with_options::<u32, _, _>(
+                target,
+                0,
+                |_: &HookTarget, _: u32| {},
+                HookOptions {
+                    discovery: HookDiscovery::FaultContained,
+                    ..HookOptions::default()
+                },
+            )
+        }
+        .unwrap();
+
+        assert_eq!(unsafe { call_slot(target, 0, 5) }, 15);
+        assert!(hook.diagnostics().enabled);
     }
 
     #[test]
@@ -1199,7 +1036,10 @@ mod tests {
             unsafe { HookFunction::new_pre::<u32, _, _>(target, 2, |_: &HookTarget, _: u32| {}) }
                 .unwrap_err();
 
-        assert!(matches!(error, HookError::SlotOutOfRange { .. }));
+        assert!(matches!(
+            error,
+            HookError::VTable(VTableError::SlotOutOfRange { .. })
+        ));
         assert_eq!(unsafe { (*target).vptr }, original);
         assert!(HookFunction::list_for_instance(target).is_empty());
         assert!(matches!(
