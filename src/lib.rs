@@ -8,6 +8,7 @@
 pub mod function;
 pub mod memory;
 pub mod method;
+pub mod vtable;
 
 #[cfg(target_os = "windows")]
 mod windows;
