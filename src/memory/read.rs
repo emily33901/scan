@@ -160,6 +160,31 @@ macro_rules! direct_native_methods {
 }
 
 /// Allocating and scalar conveniences for a direct-copy backend.
+///
+/// Generic copied values reject Rust types with invalid bit patterns:
+///
+/// ```compile_fail
+/// use scan::memory::{Address, DirectMemoryAccess, DirectMemoryAccessExt};
+///
+/// unsafe fn read_bool<M: DirectMemoryAccess>(memory: &M) {
+///     // `bool` does not implement `bytemuck::AnyBitPattern`.
+///     let _ = memory.read_value::<bool>(Address::new(0x1000));
+/// }
+/// ```
+///
+/// A bare direct read requires an explicit unsafe boundary:
+///
+/// ```compile_fail
+/// use scan::memory::{Address, DirectMemoryAccess, DirectMemoryReadExt, ReadLimits};
+///
+/// fn read_bytes<M: DirectMemoryAccess>(memory: &M) {
+///     let _ = memory.read_owned_bytes(
+///         Address::new(0x1000),
+///         4,
+///         ReadLimits::new(4, 1),
+///     );
+/// }
+/// ```
 pub trait DirectMemoryReadExt: DirectMemoryAccess {
     direct_native_methods!(
         (read_u8, u8),
@@ -347,6 +372,7 @@ impl<M: FaultContainedMemoryAccess + ?Sized> FaultContainedMemoryReadExt for M {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::testing::{FakeMemory, FakeOperation};
     use crate::memory::{AddressRange, MemoryRegion, RegionKind};
 
     struct SegmentedMemory {
@@ -430,6 +456,138 @@ mod tests {
     }
 
     const LIMITS: ReadLimits = ReadLimits::new(64, 4);
+
+    fn fake_fixture() -> (FakeMemory, Address, Address, Address) {
+        let base = Address::new(0x1000);
+        let scalar = 0x1122_3344_u32;
+        let mut bytes = vec![0xff];
+        bytes.extend_from_slice(&scalar.to_ne_bytes());
+        let address_offset = bytes.len();
+        bytes.extend_from_slice(&0usize.to_ne_bytes());
+        let string_offset = bytes.len();
+        bytes.extend_from_slice(b"hello\0");
+
+        let memory = FakeMemory::new();
+        memory
+            .map(
+                base,
+                bytes[..3].to_vec(),
+                Access::READ,
+                RegionKind::Private,
+                None,
+            )
+            .unwrap();
+        memory
+            .map(
+                base.checked_add(3).unwrap(),
+                bytes[3..].to_vec(),
+                Access::READ,
+                RegionKind::Mapped,
+                None,
+            )
+            .unwrap();
+
+        (
+            memory,
+            base.checked_add(1).unwrap(),
+            base.checked_add(address_offset).unwrap(),
+            base.checked_add(string_offset).unwrap(),
+        )
+    }
+
+    fn assert_fake_scoped_conformance() {
+        let (memory, scalar_address, pointer_address, string_address) = fake_fixture();
+        // SAFETY: the fake backend owns stable initialized storage for the
+        // entire operation and never dereferences its synthetic addresses.
+        unsafe {
+            crate::memory::with_direct_memory_scope(&memory, |scope| {
+                assert_eq!(scope.read_u32(scalar_address).unwrap(), 0x1122_3344);
+                assert_eq!(scope.read_address(pointer_address).unwrap(), Address::NULL);
+                assert_eq!(
+                    scope
+                        .read_owned_bytes(scalar_address, 4, ReadLimits::new(4, 2))
+                        .unwrap(),
+                    0x1122_3344_u32.to_ne_bytes()
+                );
+                assert_eq!(
+                    scope
+                        .read_c_string_bytes(string_address, 6, ReadLimits::new(6, 1))
+                        .unwrap(),
+                    b"hello"
+                );
+            });
+        }
+    }
+
+    fn assert_fake_fault_contained_conformance() {
+        let (memory, scalar_address, pointer_address, string_address) = fake_fixture();
+        assert_eq!(memory.try_read_u32(scalar_address).unwrap(), 0x1122_3344);
+        assert_eq!(
+            memory.try_read_address(pointer_address).unwrap(),
+            Address::NULL
+        );
+        assert_eq!(
+            memory
+                .try_read_owned_bytes(scalar_address, 4, ReadLimits::new(4, 2))
+                .unwrap(),
+            0x1122_3344_u32.to_ne_bytes()
+        );
+        assert_eq!(
+            memory
+                .try_read_c_string_bytes(string_address, 6, ReadLimits::new(6, 1))
+                .unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn fake_memory_conforms_through_scoped_and_fault_contained_reads() {
+        assert_fake_scoped_conformance();
+        assert_fake_fault_contained_conformance();
+    }
+
+    #[test]
+    fn fake_memory_reports_partial_bounded_string_copy() {
+        let address = Address::new(0x2000);
+        let partial_memory = || {
+            let memory = FakeMemory::new();
+            memory
+                .map(
+                    address,
+                    b"abc\0".to_vec(),
+                    Access::READ,
+                    RegionKind::Private,
+                    None,
+                )
+                .unwrap();
+            memory.partial_on(FakeOperation::Read, 1, 2).unwrap();
+            memory
+        };
+
+        let direct = partial_memory();
+        // SAFETY: the fake backend owns stable initialized storage and copies
+        // only from its synthetic representation.
+        unsafe {
+            crate::memory::with_direct_memory_scope(&direct, |scope| {
+                assert!(matches!(
+                    scope.read_c_string_bytes(address, 4, ReadLimits::new(4, 1)),
+                    Err(ReadError::Memory(MemoryError::PartialRead {
+                        expected: 4,
+                        actual: 2
+                    }))
+                ));
+            });
+        }
+
+        let fault_contained = partial_memory();
+        assert!(matches!(
+            fault_contained.try_read_c_string_bytes(address, 4, ReadLimits::new(4, 1)),
+            Err(ReadError::Memory(MemoryError::PartialRead {
+                expected: 4,
+                actual: 2
+            }))
+        ));
+    }
 
     #[test]
     fn reads_unaligned_native_scalar_and_null_address_value() {
