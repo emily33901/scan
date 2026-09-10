@@ -521,7 +521,7 @@ fn validate_pointer(address: usize, description: &'static str) -> HookResult<()>
     if address == 0 {
         return Err(HookError::NullPointer { what: description });
     }
-    if !address.is_multiple_of(align_of::<*const ()>()) {
+    if address % align_of::<*const ()>() != 0 {
         return Err(HookError::MisalignedPointer {
             what: description,
             address,
