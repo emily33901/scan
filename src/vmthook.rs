@@ -503,6 +503,8 @@ impl HookFunction {
     /// permitting concurrent or reentrant handlers.
     /// DEFERRED(vmthook): support extended Itanium negative vtable entries after
     /// introducing a validated, caller-supplied prefix extent.
+    /// During installation, host vptr access must either be quiescent or use
+    /// atomic operations compatible with scan's atomic load and compare-exchange.
     pub unsafe fn new_pre<R: 'static, T: 'static, Args: 'static>(
         instance: *mut T,
         index: usize,
@@ -524,6 +526,8 @@ impl HookFunction {
     /// writable, protection-stable, and synchronized through each checked load
     /// and compare-exchange. The object, original module, and captured functions
     /// must remain live for as long as dispatch is possible.
+    /// Concurrent host vptr access must either be quiescent during installation
+    /// or use atomic operations compatible with scan's load and compare-exchange.
     ///
     /// With [`HookDiscovery::Direct`], the vptr, selected ABI prefix, and every
     /// examined table word must additionally remain allocated, readable,
