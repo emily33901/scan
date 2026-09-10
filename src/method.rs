@@ -107,6 +107,46 @@ impl MethodStep {
             Self::Arm64FollowDirectBranch => MethodOperation::Arm64FollowDirectBranch,
         }
     }
+
+    const fn required_architecture(self) -> Option<Architecture> {
+        match self {
+            Self::X86ResolveRelative { .. } | Self::X86FollowDirectBranch => {
+                Some(Architecture::X86_64)
+            }
+            Self::Arm64ReadImmediate
+            | Self::Arm64ResolveImmediateRelative
+            | Self::Arm64ResolvePageOffset { .. }
+            | Self::Arm64FollowDirectBranch => Some(Architecture::Aarch64),
+            Self::Add(_)
+            | Self::ReadPointer { .. }
+            | Self::ReadUnsigned { .. }
+            | Self::UnsignedToAddress => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Architecture {
+    X86_64,
+    Aarch64,
+    Other,
+}
+
+impl Architecture {
+    #[cfg(target_arch = "x86_64")]
+    const fn current() -> Self {
+        Self::X86_64
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    const fn current() -> Self {
+        Self::Aarch64
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    const fn current() -> Self {
+        Self::Other
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,6 +266,11 @@ pub enum MethodErrorCause {
     AddressRequired { actual: MethodValueKind },
     #[error("address calculation overflowed")]
     AddressOverflow,
+    #[error("operation requires {required:?}, but current architecture is {actual:?}")]
+    UnsupportedArchitecture {
+        required: Architecture,
+        actual: Architecture,
+    },
     #[error("memory access failed")]
     Memory(#[source] MemoryError),
     #[error("instruction decoding failed")]
@@ -446,20 +491,29 @@ fn evaluate_step<R: MemoryReader + ?Sized>(
     value: MethodValue,
     step: MethodStep,
 ) -> Result<MethodValue, MethodErrorCause> {
-    if step == MethodStep::UnsignedToAddress {
-        return match value {
-            MethodValue::Unsigned(value) => usize::try_from(value)
-                .map(Address::new)
-                .map(MethodValue::Address)
-                .map_err(|_| MethodErrorCause::AddressOverflow),
-            other => Err(MethodErrorCause::AddressRequired {
-                actual: other.kind(),
-            }),
-        };
+    if let Some(required) = step.required_architecture() {
+        let actual = Architecture::current();
+        if actual != required {
+            return Err(MethodErrorCause::UnsupportedArchitecture { required, actual });
+        }
     }
-    let address = value
-        .into_address()
-        .map_err(|actual| MethodErrorCause::AddressRequired { actual })?;
+
+    let address = match step {
+        MethodStep::UnsignedToAddress => {
+            return match value {
+                MethodValue::Unsigned(value) => usize::try_from(value)
+                    .map(Address::new)
+                    .map(MethodValue::Address)
+                    .map_err(|_| MethodErrorCause::AddressOverflow),
+                other => Err(MethodErrorCause::AddressRequired {
+                    actual: other.kind(),
+                }),
+            }
+        }
+        _ => value
+            .into_address()
+            .map_err(|actual| MethodErrorCause::AddressRequired { actual })?,
+    };
     match step {
         MethodStep::Add(offset) => Ok(MethodValue::Address(checked_add_signed(address, offset)?)),
         MethodStep::ReadPointer { offset } => Ok(MethodValue::Address(
@@ -523,7 +577,9 @@ fn evaluate_step<R: MemoryReader + ?Sized>(
         MethodStep::Arm64FollowDirectBranch => Ok(MethodValue::Address(
             aarch64::direct_branch_target(address, evaluation.read_u32_instruction(address)?)?,
         )),
-        MethodStep::UnsignedToAddress => unreachable!("handled before address extraction"),
+        MethodStep::UnsignedToAddress => Err(MethodErrorCause::AddressRequired {
+            actual: value.kind(),
+        }),
     }
 }
 
@@ -578,6 +634,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn resolves_signed_x86_displacement() {
         assert_eq!(
             evaluate_fault(
@@ -593,6 +650,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn follows_x86_branch_without_overreading() {
         assert_eq!(
             evaluate_fault(&[0xeb, 0xfe], &[MethodStep::X86FollowDirectBranch]).unwrap(),
@@ -601,6 +659,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn arm_page_pair_applies_the_plan_offset() {
         let adrp_x3 = 0x9000_0003_u32;
         let add_x3_x3_20 = 0x9100_5063_u32;
@@ -640,9 +699,20 @@ mod tests {
             .unwrap(),
             MethodValue::Unsigned(0x1234)
         );
+
+        let null = evaluate_fault(
+            &[0; size_of::<usize>()],
+            &[MethodStep::ReadPointer { offset: 0 }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            null.cause,
+            MethodErrorCause::Memory(MemoryError::NullAddress)
+        ));
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn preserves_typed_step_context() {
         let error = evaluate_fault(&[0x90], &[MethodStep::X86FollowDirectBranch]).unwrap_err();
         assert_eq!(error.step_index, 0);
@@ -667,20 +737,38 @@ mod tests {
             MethodErrorCause::StepLimitExceeded { .. }
         ));
 
-        let limits = MethodLimits {
-            max_instruction_bytes: 1,
-            ..MethodLimits::default()
-        };
-        let error = MethodPlan::new(&[MethodStep::X86ResolveRelative {
-            displacement_offset: 0,
-            width: SignedWidth::I32,
-        }])
-        .evaluate_fault_contained(&memory(&[0; 4]), BASE, limits)
-        .unwrap_err();
-        assert!(matches!(
-            error.cause,
-            MethodErrorCause::InstructionByteLimitExceeded { .. }
-        ));
+        #[cfg(target_arch = "x86_64")]
+        {
+            let limits = MethodLimits {
+                max_instruction_bytes: 1,
+                ..MethodLimits::default()
+            };
+            let error = MethodPlan::new(&[MethodStep::X86ResolveRelative {
+                displacement_offset: 0,
+                width: SignedWidth::I32,
+            }])
+            .evaluate_fault_contained(&memory(&[0; 4]), BASE, limits)
+            .unwrap_err();
+            assert!(matches!(
+                error.cause,
+                MethodErrorCause::InstructionByteLimitExceeded { .. }
+            ));
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let limits = MethodLimits {
+                max_instruction_bytes: 1,
+                ..MethodLimits::default()
+            };
+            let error = MethodPlan::new(&[MethodStep::Arm64ReadImmediate])
+                .evaluate_fault_contained(&memory(&[0; 4]), BASE, limits)
+                .unwrap_err();
+            assert!(matches!(
+                error.cause,
+                MethodErrorCause::InstructionByteLimitExceeded { .. }
+            ));
+        }
 
         let error = evaluate_fault(
             &[1],
@@ -705,5 +793,55 @@ mod tests {
     fn memory_failures_remain_typed() {
         let error = evaluate_fault(&[0], &[MethodStep::ReadPointer { offset: 0 }]).unwrap_err();
         assert!(matches!(error.cause, MethodErrorCause::Memory(_)));
+    }
+
+    #[test]
+    fn rejects_steps_for_a_different_architecture() {
+        #[cfg(target_arch = "x86_64")]
+        let step = MethodStep::Arm64ReadImmediate;
+        #[cfg(target_arch = "aarch64")]
+        let step = MethodStep::X86FollowDirectBranch;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let step = MethodStep::X86FollowDirectBranch;
+
+        let error = evaluate_fault(&[0; 8], &[step]).unwrap_err();
+        assert_eq!(error.step_index, 0);
+        assert!(matches!(
+            error.cause,
+            MethodErrorCause::UnsupportedArchitecture { .. }
+        ));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_range_honors_region_limit() {
+        let memory = FakeMemory::new();
+        for (offset, bytes) in [(0, [0xfc, 0xff]), (2, [0xff, 0xff])] {
+            memory
+                .map_region(
+                    MemoryRegion {
+                        range: BASE.checked_add(offset).unwrap().checked_range(2).unwrap(),
+                        access: Access::READ,
+                        kind: RegionKind::Private,
+                        module: None,
+                    },
+                    bytes,
+                )
+                .unwrap();
+        }
+        let limits = MethodLimits {
+            max_regions_per_read: 1,
+            ..MethodLimits::default()
+        };
+        let error = MethodPlan::new(&[MethodStep::X86ResolveRelative {
+            displacement_offset: 0,
+            width: SignedWidth::I32,
+        }])
+        .evaluate_fault_contained(&memory, BASE, limits)
+        .unwrap_err();
+        assert!(matches!(
+            error.cause,
+            MethodErrorCause::Memory(MemoryError::RegionLimitExceeded { limit: 1 })
+        ));
     }
 }
