@@ -13,6 +13,7 @@ use crate::memory::{
     Access, Address, DirectMemoryAccess, DirectMemoryAccessExt, DirectMemoryScope,
     FaultContainedMemoryAccess, FaultContainedMemoryAccessExt, MemoryError, MemoryRegion,
 };
+use crate::module::{LoadedModule, Section};
 
 /// Absolute ceiling for null-terminated vtable discovery.
 pub const HARD_MAX_VTABLE_SLOTS: usize = 65_536;
@@ -62,27 +63,72 @@ impl CxxAbi {
     }
 }
 
+/// Module proof used to authorize each copied function entry.
+///
+/// Unlike [`ExecutablePolicy`], this policy is address-independent. Discovery
+/// derives a fresh opaque executable policy from the copied module metadata for
+/// every non-null entry, preventing a proof for one function from authorizing a
+/// different address.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VTableExecutablePolicy<'module> {
+    #[default]
+    AnyExecutable,
+    /// Reuses an already-derived address-specific policy. This is primarily
+    /// useful for one-entry discovery; the function layer rejects reuse for a
+    /// different copied entry.
+    ExactAddress(ExecutablePolicy),
+    Image(&'module LoadedModule),
+    Module(&'module LoadedModule),
+    ExecutableSection {
+        module: &'module LoadedModule,
+        section: &'module Section,
+    },
+}
+
+impl VTableExecutablePolicy<'_> {
+    fn for_address(self, address: Address) -> Result<ExecutablePolicy, FunctionError> {
+        match self {
+            Self::AnyExecutable => Ok(ExecutablePolicy::AnyExecutable),
+            Self::ExactAddress(policy) => Ok(policy),
+            Self::Image(module) => ExecutablePolicy::for_image(module, address),
+            Self::Module(module) => ExecutablePolicy::for_module(module, address),
+            Self::ExecutableSection { module, section } => {
+                ExecutablePolicy::for_executable_section(module, section, address)
+            }
+        }
+    }
+}
+
+impl From<ExecutablePolicy> for VTableExecutablePolicy<'_> {
+    fn from(policy: ExecutablePolicy) -> Self {
+        match policy {
+            ExecutablePolicy::AnyExecutable => Self::AnyExecutable,
+            other => Self::ExactAddress(other),
+        }
+    }
+}
+
 /// Limits and validation policy for one discovery operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VTableSpec {
+pub struct VTableSpec<'module> {
     pub abi: CxxAbi,
     pub slot: usize,
     pub max_slots: usize,
-    pub executable_policy: ExecutablePolicy,
+    pub executable_policy: VTableExecutablePolicy<'module>,
 }
 
-impl VTableSpec {
-    pub const fn new(
+impl<'module> VTableSpec<'module> {
+    pub fn new(
         abi: CxxAbi,
         slot: usize,
         max_slots: usize,
-        executable_policy: ExecutablePolicy,
+        executable_policy: impl Into<VTableExecutablePolicy<'module>>,
     ) -> Self {
         Self {
             abi,
             slot,
             max_slots,
-            executable_policy,
+            executable_policy: executable_policy.into(),
         }
     }
 }
@@ -267,7 +313,7 @@ impl<M: FaultContainedMemoryAccess + ?Sized> VTableReader for FaultContainedRead
 pub unsafe fn discover_direct<M: DirectMemoryAccess + ?Sized>(
     memory: &M,
     object: Address,
-    spec: VTableSpec,
+    spec: VTableSpec<'_>,
 ) -> Result<DiscoveredVTable, VTableError> {
     discover(&DirectReader(memory), object, spec)
 }
@@ -276,7 +322,7 @@ pub unsafe fn discover_direct<M: DirectMemoryAccess + ?Sized>(
 pub fn discover_scoped<M: DirectMemoryAccess + ?Sized>(
     scope: &DirectMemoryScope<'_, M>,
     object: Address,
-    spec: VTableSpec,
+    spec: VTableSpec<'_>,
 ) -> Result<DiscoveredVTable, VTableError> {
     discover(&ScopedReader(scope), object, spec)
 }
@@ -285,7 +331,7 @@ pub fn discover_scoped<M: DirectMemoryAccess + ?Sized>(
 pub fn discover_fault_contained<M: FaultContainedMemoryAccess + ?Sized>(
     memory: &M,
     object: Address,
-    spec: VTableSpec,
+    spec: VTableSpec<'_>,
 ) -> Result<DiscoveredVTable, VTableError> {
     discover(&FaultContainedReader(memory), object, spec)
 }
@@ -295,7 +341,7 @@ impl<M: DirectMemoryAccess + ?Sized> DirectMemoryScope<'_, M> {
     pub fn discover_vtable(
         &self,
         object: Address,
-        spec: VTableSpec,
+        spec: VTableSpec<'_>,
     ) -> Result<DiscoveredVTable, VTableError> {
         discover_scoped(self, object, spec)
     }
@@ -304,7 +350,7 @@ impl<M: DirectMemoryAccess + ?Sized> DirectMemoryScope<'_, M> {
 fn discover<R: VTableReader + ?Sized>(
     reader: &R,
     object: Address,
-    spec: VTableSpec,
+    spec: VTableSpec<'_>,
 ) -> Result<DiscoveredVTable, VTableError> {
     let pointer_size = size_of::<usize>();
     if pointer_size != 8 {
@@ -428,8 +474,16 @@ fn discover<R: VTableReader + ?Sized>(
             terminated = true;
             break;
         }
+        let executable_policy = spec
+            .executable_policy
+            .for_address(entry)
+            .map_err(|source| VTableError::InvalidExecutable {
+                slot,
+                address: entry,
+                source,
+            })?;
         let executable = reader
-            .executable(entry, spec.executable_policy)
+            .executable(entry, executable_policy)
             .map_err(|source| VTableError::InvalidExecutable {
                 slot,
                 address: entry,
@@ -466,6 +520,7 @@ mod tests {
 
     use super::*;
     use crate::memory::{AddressRange, MemoryMap, ModuleId, RegionKind, DEFAULT_MAX_REGIONS};
+    use crate::module::ImageFormat;
 
     const NEVER_FAIL: usize = usize::MAX;
 
@@ -641,8 +696,19 @@ mod tests {
             }
         }
 
-        fn spec(&self, abi: CxxAbi, slot: usize, max_slots: usize) -> VTableSpec {
-            VTableSpec::new(abi, slot, max_slots, ExecutablePolicy::AnyExecutable)
+        fn spec(&self, abi: CxxAbi, slot: usize, max_slots: usize) -> VTableSpec<'static> {
+            VTableSpec::new(abi, slot, max_slots, VTableExecutablePolicy::AnyExecutable)
+        }
+    }
+
+    fn loaded_module(id: ModuleId, mapped: AddressRange) -> LoadedModule {
+        LoadedModule {
+            id,
+            path: "test-module".into(),
+            image: mapped,
+            mapped_ranges: vec![mapped],
+            format: ImageFormat::Pe,
+            sections: Vec::new(),
         }
     }
 
@@ -774,10 +840,38 @@ mod tests {
     }
 
     #[test]
-    fn executable_module_policy_is_enforced() {
-        let functions = [function_address(first_function)];
+    fn executable_module_policy_is_derived_for_each_entry() {
+        let functions = [
+            function_address(first_function),
+            function_address(second_function),
+        ];
         let fixture = Fixture::new(CxxAbi::Msvc64, &functions, true, ModuleId(7));
-        let spec = VTableSpec::new(CxxAbi::Msvc64, 0, 4, ExecutablePolicy::Module(ModuleId(8)));
+
+        let first = *functions.iter().min().unwrap();
+        let last = functions.iter().max().unwrap().checked_add(1).unwrap();
+        let module = loaded_module(
+            ModuleId(8),
+            AddressRange::from_bounds(Address::new(first), Address::new(last)).unwrap(),
+        );
+        let spec = VTableSpec::new(
+            CxxAbi::Msvc64,
+            1,
+            4,
+            VTableExecutablePolicy::Module(&module),
+        );
+        let found = unsafe { discover_direct(&fixture.memory, fixture.object, spec).unwrap() };
+        assert_eq!(found.entries().len(), 2);
+
+        let unrelated = loaded_module(
+            ModuleId(9),
+            AddressRange::new(Address::new(0x1000), 0x100).unwrap(),
+        );
+        let spec = VTableSpec::new(
+            CxxAbi::Msvc64,
+            0,
+            4,
+            VTableExecutablePolicy::Module(&unrelated),
+        );
         let error = unsafe { discover_direct(&fixture.memory, fixture.object, spec).unwrap_err() };
         assert!(matches!(
             error,
