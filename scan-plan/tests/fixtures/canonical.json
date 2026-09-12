@@ -1,0 +1,279 @@
+{
+  "cases": [
+    {
+      "name": "empty plan applies positive match offset",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "match_offset": 7,
+      "plan": { "schema_version": 1, "result": "address", "steps": [] },
+      "expected": { "outcome": "value", "kind": "address", "value": 4103 }
+    },
+    {
+      "name": "negative match offset underflows",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 2,
+      "match_offset": -3,
+      "plan": { "schema_version": 1, "result": "address", "steps": [] },
+      "expected": { "outcome": "match_offset_error" }
+    },
+    {
+      "name": "signed add can move backwards",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "add", "offset": 32 }, { "action": "add", "offset": -16 }
+      ] },
+      "expected": { "outcome": "value", "kind": "address", "value": 4112 }
+    },
+    {
+      "name": "signed add underflow is rejected",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 0,
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "add", "offset": -1 }
+      ] },
+      "expected": { "outcome": "error", "step": 0, "cause": "address_overflow" }
+    },
+    {
+      "name": "u64 pointer read honors its offset",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4098, "bytes": [120, 86, 52, 18, 0, 0, 0, 0] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "read_pointer", "offset": 2, "width": "u64" }
+      ] },
+      "expected": { "outcome": "value", "kind": "address", "value": 305419896 }
+    },
+    {
+      "name": "null pointer is rejected",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [0, 0, 0, 0, 0, 0, 0, 0] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "read_pointer", "offset": 0, "width": "u64" }
+      ] },
+      "expected": { "outcome": "error", "step": 0, "cause": "null_pointer" }
+    },
+    {
+      "name": "pointer width must match target",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "read_pointer", "offset": 0, "width": "u32" }
+      ] },
+      "expected": { "outcome": "error", "step": 0, "cause": "pointer_width_mismatch" }
+    },
+    {
+      "name": "all unsigned widths remain typed",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4100, "bytes": [239, 205, 171, 137, 103, 69, 35, 1] }],
+      "plan": { "schema_version": 1, "result": "unsigned", "steps": [
+        { "action": "read_unsigned", "offset": 4, "width": "u64" }
+      ] },
+      "expected": { "outcome": "value", "kind": "unsigned", "value": 81985529216486895 }
+    },
+    {
+      "name": "u8 unsigned read",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [171] }],
+      "plan": { "schema_version": 1, "result": "unsigned", "steps": [
+        { "action": "read_unsigned", "offset": 0, "width": "u8" }
+      ] },
+      "expected": { "outcome": "value", "kind": "unsigned", "value": 171 }
+    },
+    {
+      "name": "u16 unsigned read",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [52, 18] }],
+      "plan": { "schema_version": 1, "result": "unsigned", "steps": [
+        { "action": "read_unsigned", "offset": 0, "width": "u16" }
+      ] },
+      "expected": { "outcome": "value", "kind": "unsigned", "value": 4660 }
+    },
+    {
+      "name": "u32 unsigned read",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [239, 205, 171, 137] }],
+      "plan": { "schema_version": 1, "result": "unsigned", "steps": [
+        { "action": "read_unsigned", "offset": 0, "width": "u32" }
+      ] },
+      "expected": { "outcome": "value", "kind": "unsigned", "value": 2309737967 }
+    },
+    {
+      "name": "unsigned conversion is explicit",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [32, 16, 0, 0] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "read_unsigned", "offset": 0, "width": "u32" },
+        { "action": "unsigned_to_address" },
+        { "action": "add", "offset": 4 }
+      ] },
+      "expected": { "outcome": "value", "kind": "address", "value": 4132 }
+    },
+    {
+      "name": "scalar cannot feed address action implicitly",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [1] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "read_unsigned", "offset": 0, "width": "u8" },
+        { "action": "add", "offset": 1 }
+      ] },
+      "expected": { "outcome": "error", "step": 1, "cause": "address_required" }
+    },
+    {
+      "name": "x86 rel32 negative displacement",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4097, "bytes": [246, 255, 255, 255] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "x86_resolve_relative", "displacement_offset": 1, "width": "i32" }
+      ] },
+      "expected": { "outcome": "value", "kind": "address", "value": 4091 }
+    },
+    {
+      "name": "x86 rel64 is not narrowed",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [240, 255, 255, 255, 255, 255, 255, 255] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "x86_resolve_relative", "displacement_offset": 0, "width": "i64" }
+      ] },
+      "expected": { "outcome": "value", "kind": "address", "value": 4088 }
+    },
+    {
+      "name": "x86 relative then pointer chain",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [232, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 86, 52, 18, 0, 0, 0, 0] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "x86_resolve_relative", "displacement_offset": 1, "width": "i32" },
+        { "action": "read_pointer", "offset": 0, "width": "u64" }
+      ] },
+      "expected": { "outcome": "value", "kind": "address", "value": 305419896 }
+    },
+    {
+      "name": "x86 short branch",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [235, 240] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [{ "action": "x86_follow_direct_branch" }] },
+      "expected": { "outcome": "value", "kind": "address", "value": 4082 }
+    },
+    {
+      "name": "x86 near conditional branch",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [15, 133, 246, 255, 255, 255] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [{ "action": "x86_follow_direct_branch" }] },
+      "expected": { "outcome": "value", "kind": "address", "value": 4092 }
+    },
+    {
+      "name": "arm immediate preserves negative signed value",
+      "context": { "architecture": "aarch64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [255, 255, 255, 151] }],
+      "plan": { "schema_version": 1, "result": "signed", "steps": [{ "action": "arm64_read_immediate" }] },
+      "expected": { "outcome": "value", "kind": "signed", "value": -4 }
+    },
+    {
+      "name": "arm immediate relative moves backwards",
+      "context": { "architecture": "aarch64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [255, 255, 255, 151] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [{ "action": "arm64_resolve_immediate_relative" }] },
+      "expected": { "outcome": "value", "kind": "address", "value": 4092 }
+    },
+    {
+      "name": "arm page pair honors nonzero instruction offset",
+      "context": { "architecture": "aarch64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 8184,
+      "memory": [{ "address": 8188, "bytes": [0, 0, 0, 176, 0, 128, 4, 145] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "arm64_resolve_page_offset", "instruction_offset": 4 }
+      ] },
+      "expected": { "outcome": "value", "kind": "address", "value": 8480 }
+    },
+    {
+      "name": "arm page pair scales ldr offset",
+      "context": { "architecture": "aarch64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 8188,
+      "memory": [{ "address": 8188, "bytes": [3, 0, 0, 176, 96, 252, 127, 249] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [
+        { "action": "arm64_resolve_page_offset", "instruction_offset": 0 }
+      ] },
+      "expected": { "outcome": "value", "kind": "address", "value": 40952 }
+    },
+    {
+      "name": "arm direct branch follows bl",
+      "context": { "architecture": "aarch64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [2, 0, 0, 148] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [{ "action": "arm64_follow_direct_branch" }] },
+      "expected": { "outcome": "value", "kind": "address", "value": 4104 }
+    },
+    {
+      "name": "architecture mismatch is rejected at action",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "plan": { "schema_version": 1, "result": "signed", "steps": [{ "action": "arm64_read_immediate" }] },
+      "expected": { "outcome": "error", "step": 0, "cause": "unsupported_architecture" }
+    },
+    {
+      "name": "truncated memory is a checked read error",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [232, 0, 0] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [{ "action": "x86_follow_direct_branch" }] },
+      "expected": { "outcome": "error", "step": 0, "cause": "memory" }
+    },
+    {
+      "name": "terminal result kind is enforced",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "memory": [{ "address": 4096, "bytes": [1] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [{ "action": "read_unsigned", "offset": 0, "width": "u8" }] },
+      "expected": { "outcome": "error", "step": 1, "cause": "result_kind_mismatch" }
+    },
+    {
+      "name": "whole plan step limit",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "limits": { "max_steps": 1 },
+      "plan": { "schema_version": 1, "result": "address", "steps": [{ "action": "add", "offset": 1 }, { "action": "add", "offset": 1 }] },
+      "expected": { "outcome": "error", "step": 1, "cause": "step_limit_exceeded" }
+    },
+    {
+      "name": "whole plan instruction byte limit",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "limits": { "max_instruction_bytes": 4 },
+      "memory": [{ "address": 4096, "bytes": [232, 0, 0, 0, 0] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [{ "action": "x86_follow_direct_branch" }] },
+      "expected": { "outcome": "error", "step": 0, "cause": "instruction_byte_limit_exceeded" }
+    },
+    {
+      "name": "whole plan read byte limit",
+      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "limits": { "max_read_bytes": 3 },
+      "memory": [{ "address": 4096, "bytes": [1, 2, 3, 4] }],
+      "plan": { "schema_version": 1, "result": "unsigned", "steps": [{ "action": "read_unsigned", "offset": 0, "width": "u32" }] },
+      "expected": { "outcome": "error", "step": 0, "cause": "read_byte_limit_exceeded" }
+    },
+    {
+      "name": "whole plan read count limit",
+      "context": { "architecture": "aarch64", "pointer_width": "u64", "byte_order": "little" },
+      "raw_match": 4096,
+      "limits": { "max_reads": 1 },
+      "memory": [{ "address": 4096, "bytes": [0, 0, 0, 144, 0, 0, 0, 145] }],
+      "plan": { "schema_version": 1, "result": "address", "steps": [{ "action": "arm64_resolve_page_offset", "instruction_offset": 0 }] },
+      "expected": { "outcome": "error", "step": 0, "cause": "read_limit_exceeded" }
+    }
+  ]
+}
