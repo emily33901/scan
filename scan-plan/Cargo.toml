@@ -1,0 +1,18 @@
+[package]
+name = "scan-plan"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+license = "BSD-2-Clause"
+description = "Portable, bounded evaluation of typed binary scan plans"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
