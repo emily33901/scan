@@ -11,12 +11,13 @@ rust-version = "1.84"
 [features]
 default = []
 fault-contained = []
+serde = ["scan-plan/serde"]
 test-support = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-scan-plan = { path = "scan-plan", default-features = false }
+scan-plan = { version = "0.1.0", path = "scan-plan", default-features = false }
 bitflags = "2"
 bytemuck = "1"
 parking_lot = "0.12.1"

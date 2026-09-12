@@ -180,7 +180,7 @@ fn canonical_golden_cases() {
 }
 
 #[test]
-fn supported_contexts_are_explicit() {
+fn target_context_controls_pointer_width_and_byte_order() {
     let plan = Plan::new(scan_plan::ValueKind::Address, vec![]);
     let memory = Case {
         name: "context".into(),
@@ -200,7 +200,7 @@ fn supported_contexts_are_explicit() {
         },
     };
 
-    for context in [
+    let contexts = [
         TargetContext {
             architecture: TargetArchitecture::X86_64,
             pointer_width: PointerWidth::U32,
@@ -211,13 +211,42 @@ fn supported_contexts_are_explicit() {
             pointer_width: PointerWidth::U64,
             byte_order: ByteOrder::Big,
         },
-    ] {
-        let error = plan
-            .evaluate(&memory, 0, context, Limits::default())
-            .unwrap_err();
-        assert!(matches!(
-            error.cause,
-            EvaluationErrorCause::UnsupportedTargetContext { .. }
-        ));
+    ];
+    for context in contexts {
+        assert_eq!(
+            plan.evaluate(&memory, 0, context, Limits::default())
+                .unwrap(),
+            Value::Address(0)
+        );
     }
+
+    let memory = Case {
+        memory: vec![MemoryRange {
+            address: 0,
+            bytes: vec![0, 0, 0x12, 0x34],
+        }],
+        ..memory
+    };
+    let pointer = Plan::new(
+        scan_plan::ValueKind::Address,
+        vec![scan_plan::Step::ReadPointer {
+            offset: 0,
+            width: PointerWidth::U32,
+        }],
+    );
+    assert_eq!(
+        pointer
+            .evaluate(
+                &memory,
+                0,
+                TargetContext {
+                    architecture: TargetArchitecture::Aarch64,
+                    pointer_width: PointerWidth::U32,
+                    byte_order: ByteOrder::Big,
+                },
+                Limits::default(),
+            )
+            .unwrap(),
+        Value::Address(0x1234)
+    );
 }

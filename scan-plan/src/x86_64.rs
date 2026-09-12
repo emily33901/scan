@@ -51,11 +51,9 @@ pub(crate) fn direct_branch_length(bytes: &[u8]) -> Result<usize, InstructionErr
 
 pub(crate) fn relative_target(
     address: u64,
-    instruction_size: usize,
+    instruction_size: u64,
     displacement: i64,
 ) -> Result<u64, InstructionError> {
-    let instruction_size =
-        u64::try_from(instruction_size).map_err(|_| InstructionError::AddressOverflow)?;
     address
         .checked_add(instruction_size)
         .and_then(|next| next.checked_add_signed(displacement))

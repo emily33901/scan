@@ -506,17 +506,6 @@ pub fn evaluate<M: PlanMemory + ?Sized>(
     context: TargetContext,
     limits: Limits,
 ) -> Result<Value, EvaluationError<M::Error>> {
-    if context.pointer_width != PointerWidth::U64 || context.byte_order != ByteOrder::Little {
-        return Err(EvaluationError {
-            step_index: 0,
-            operation: Operation::Plan,
-            cause: EvaluationErrorCause::UnsupportedTargetContext {
-                architecture: context.architecture,
-                pointer_width: context.pointer_width,
-                byte_order: context.byte_order,
-            },
-        });
-    }
     if plan.steps.len() > limits.max_steps {
         return Err(EvaluationError {
             step_index: limits.max_steps,
@@ -610,7 +599,7 @@ fn evaluate_step<M: PlanMemory + ?Sized>(
                 .ok_or(EvaluationErrorCause::AddressOverflow)?;
             Ok(Value::Address(x86_64::relative_target(
                 address,
-                usize::try_from(end_offset).map_err(|_| EvaluationErrorCause::AddressOverflow)?,
+                end_offset,
                 displacement,
             )?))
         }
@@ -860,23 +849,6 @@ mod tests {
         assert!(matches!(
             width.cause,
             EvaluationErrorCause::PointerWidthMismatch { .. }
-        ));
-
-        let invalid_context = Plan::new(ValueKind::Address, vec![])
-            .evaluate(
-                &TestMemory(vec![]),
-                BASE,
-                TargetContext {
-                    architecture: TargetArchitecture::X86_64,
-                    pointer_width: PointerWidth::U64,
-                    byte_order: ByteOrder::Big,
-                },
-                Limits::default(),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            invalid_context.cause,
-            EvaluationErrorCause::UnsupportedTargetContext { .. }
         ));
 
         let range = Plan::new(

@@ -191,6 +191,16 @@ impl<'a> MethodPlan<'a> {
         start: Address,
         limits: MethodLimits,
     ) -> Result<MethodValue, MethodError> {
+        if self.steps.len() > limits.max_steps {
+            return Err(MethodError {
+                step_index: limits.max_steps,
+                operation: MethodOperation::Plan,
+                cause: MethodErrorCause::StepLimitExceeded {
+                    actual: self.steps.len(),
+                    limit: limits.max_steps,
+                },
+            });
+        }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         validate_architectures(self.steps)?;
         let mut steps = Vec::with_capacity(self.steps.len());

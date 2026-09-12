@@ -4,7 +4,7 @@ use crate::InstructionError;
 
 const ADRP_MASK: u32 = 0x9f00_0000;
 const ADRP_OPCODE: u32 = 0x9000_0000;
-const ADD_X_IMMEDIATE_MASK: u32 = 0xff00_0000;
+const ADD_X_IMMEDIATE_MASK: u32 = 0xff80_0000;
 const ADD_X_IMMEDIATE_OPCODE: u32 = 0x9100_0000;
 const LDR_X_UNSIGNED_MASK: u32 = 0xffc0_0000;
 const LDR_X_UNSIGNED_OPCODE: u32 = 0xf940_0000;
@@ -167,6 +167,14 @@ mod tests {
         assert!(matches!(
             page_pair_target(0x1000, adrp(31, 0), ldr(0, 31, 1)),
             Err(InstructionError::InvalidRegister { .. })
+        ));
+        assert!(matches!(
+            page_pair_target(0x1000, adrp(0, 0), 0x9181_0000),
+            Err(InstructionError::UnsupportedOpcode { .. })
+        ));
+        assert!(matches!(
+            instruction_immediate(0x9181_0000),
+            Err(InstructionError::UnsupportedOpcode { .. })
         ));
     }
 
