@@ -11,6 +11,25 @@ use thiserror::Error;
 /// The only schema version this crate writes or accepts.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Applies a recipe's signed match offset to a raw target address.
+pub fn apply_match_offset(raw_match: u64, match_offset: i64) -> Result<u64, MatchOffsetError> {
+    raw_match
+        .checked_add_signed(match_offset)
+        .ok_or(MatchOffsetError {
+            raw_match,
+            match_offset,
+        })
+}
+
+/// The raw match and signed offset do not identify a target address.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("match offset {match_offset} overflows raw match address {raw_match:#x}")]
+#[non_exhaustive]
+pub struct MatchOffsetError {
+    pub raw_match: u64,
+    pub match_offset: i64,
+}
+
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -767,6 +786,21 @@ mod tests {
             run(&[], TargetArchitecture::X86_64, ValueKind::Address, vec![]).unwrap(),
             Value::Address(BASE)
         );
+    }
+
+    #[test]
+    fn applies_signed_match_offsets_with_checked_target_arithmetic() {
+        assert_eq!(apply_match_offset(BASE, 7).unwrap(), BASE + 7);
+        assert_eq!(apply_match_offset(BASE, -7).unwrap(), BASE - 7);
+
+        let underflow = apply_match_offset(0, -1).unwrap_err();
+        assert_eq!(underflow.raw_match, 0);
+        assert_eq!(underflow.match_offset, -1);
+
+        let overflow = apply_match_offset(u64::MAX, 1).unwrap_err();
+        assert_eq!(overflow.raw_match, u64::MAX);
+        assert_eq!(overflow.match_offset, 1);
+        assert!(apply_match_offset(0, i64::MIN).is_err());
     }
 
     #[test]

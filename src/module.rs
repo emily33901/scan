@@ -1509,12 +1509,13 @@ where
 }
 
 fn match_address(section: &Section, position: usize, offset: i64) -> Result<Address, ModuleError> {
-    section
-        .range
-        .start()
-        .checked_add(position)?
-        .checked_add_signed(offset)
-        .map_err(ModuleError::from)
+    let raw_match = section.range.start().checked_add(position)?;
+    let raw_match = u64::try_from(raw_match.get()).map_err(|_| ModuleError::AddressOverflow)?;
+    let plan_start = scan_plan::apply_match_offset(raw_match, offset)
+        .map_err(|_| ModuleError::AddressOverflow)?;
+    usize::try_from(plan_start)
+        .map(Address::new)
+        .map_err(|_| ModuleError::AddressOverflow)
 }
 
 fn read_array<const N: usize, R>(read: &mut R, address: Address) -> Result<[u8; N], ModuleError>
@@ -1915,6 +1916,15 @@ mod tests {
         assert!(matches!(
             scan_section_all(&section, "aa bb", 0, limits, &mut read),
             Err(ModuleError::ResultLimit { limit: 1 })
+        ));
+
+        assert_eq!(
+            match_address(&section, 2, -1).unwrap(),
+            section.range.start().checked_add(1).unwrap()
+        );
+        assert!(matches!(
+            match_address(&section, 0, i64::MIN),
+            Err(ModuleError::AddressOverflow)
         ));
     }
 

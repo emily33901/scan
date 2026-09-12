@@ -3,8 +3,8 @@
 use std::fmt;
 
 use scan_plan::{
-    ByteOrder, EvaluationErrorCause, Limits, Plan, PlanMemory, PointerWidth, ReadPurpose,
-    TargetArchitecture, TargetContext, Value,
+    apply_match_offset, ByteOrder, EvaluationErrorCause, Limits, Plan, PlanMemory, PointerWidth,
+    ReadPurpose, TargetArchitecture, TargetContext, Value,
 };
 use serde::Deserialize;
 
@@ -109,14 +109,6 @@ impl PlanMemory for Case {
     }
 }
 
-fn checked_match_offset(address: u64, offset: i64) -> Option<u64> {
-    if offset >= 0 {
-        address.checked_add(offset as u64)
-    } else {
-        address.checked_sub(offset.unsigned_abs())
-    }
-}
-
 fn cause_name(cause: &EvaluationErrorCause<FixtureMemoryError>) -> &'static str {
     match cause {
         EvaluationErrorCause::StepLimitExceeded { .. } => "step_limit_exceeded",
@@ -153,17 +145,18 @@ fn canonical_golden_cases() {
         .expect("canonical fixture corpus must deserialize");
 
     for case in corpus.cases {
-        let start = checked_match_offset(case.raw_match, case.match_offset);
+        let start = apply_match_offset(case.raw_match, case.match_offset);
         if matches!(case.expected, Expected::MatchOffsetError) {
             assert!(
-                start.is_none(),
+                start.is_err(),
                 "{}: match offset should overflow",
                 case.name
             );
             continue;
         }
-        let start =
-            start.unwrap_or_else(|| panic!("{}: unexpected match offset overflow", case.name));
+        let start = start.unwrap_or_else(|error| {
+            panic!("{}: unexpected match offset error: {error}", case.name)
+        });
         let actual = case
             .plan
             .evaluate(&case, start, case.context, case.limits.resolve());
