@@ -3,8 +3,8 @@
 use std::fmt;
 
 use scan_plan::{
-    ByteOrder, EvaluationErrorCause, Limits, Plan, PlanMemory, PointerWidth, TargetArchitecture,
-    TargetContext, Value,
+    ByteOrder, EvaluationErrorCause, Limits, Plan, PlanMemory, PointerWidth, ReadPurpose,
+    TargetArchitecture, TargetContext, Value,
 };
 use serde::Deserialize;
 
@@ -84,7 +84,12 @@ impl std::error::Error for FixtureMemoryError {}
 impl PlanMemory for Case {
     type Error = FixtureMemoryError;
 
-    fn read_exact(&self, address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
+    fn read_exact(
+        &self,
+        address: u64,
+        _purpose: ReadPurpose,
+        destination: &mut [u8],
+    ) -> Result<(), Self::Error> {
         for range in &self.memory {
             let Some(offset) = address.checked_sub(range.address) else {
                 continue;

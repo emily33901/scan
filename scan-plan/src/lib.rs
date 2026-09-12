@@ -236,11 +236,25 @@ impl<'de> serde::Deserialize<'de> for Plan {
     }
 }
 
+/// Describes why the evaluator is requesting target bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ReadPurpose {
+    Instruction,
+    Pointer,
+    Unsigned,
+}
+
 /// Checked access to bytes in the target's virtual address space.
 pub trait PlanMemory {
     type Error: StdError + 'static;
 
-    fn read_exact(&self, target_address: u64, destination: &mut [u8]) -> Result<(), Self::Error>;
+    fn read_exact(
+        &self,
+        target_address: u64,
+        purpose: ReadPurpose,
+        destination: &mut [u8],
+    ) -> Result<(), Self::Error>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -370,6 +384,7 @@ impl<M: PlanMemory + ?Sized> Evaluation<'_, M> {
     fn read(
         &mut self,
         address: u64,
+        purpose: ReadPurpose,
         output: &mut [u8],
     ) -> Result<(), EvaluationErrorCause<M::Error>> {
         if let Some(last_offset) = output.len().checked_sub(1) {
@@ -405,7 +420,7 @@ impl<M: PlanMemory + ?Sized> Evaluation<'_, M> {
             });
         }
         self.memory
-            .read_exact(address, output)
+            .read_exact(address, purpose, output)
             .map_err(EvaluationErrorCause::Memory)?;
         self.reads = reads;
         self.read_bytes = read_bytes;
@@ -429,7 +444,7 @@ impl<M: PlanMemory + ?Sized> Evaluation<'_, M> {
                 limit: self.limits.max_instruction_bytes,
             });
         }
-        self.read(address, output)?;
+        self.read(address, ReadPurpose::Instruction, output)?;
         self.instruction_bytes = used;
         Ok(())
     }
@@ -453,7 +468,7 @@ impl<M: PlanMemory + ?Sized> Evaluation<'_, M> {
     ) -> Result<u64, EvaluationErrorCause<M::Error>> {
         let mut bytes = [0; 8];
         let len = width.bytes();
-        self.read(address, &mut bytes[..len])?;
+        self.read(address, ReadPurpose::Unsigned, &mut bytes[..len])?;
         Ok(decode_unsigned(&bytes[..len], self.context.byte_order))
     }
 
@@ -470,7 +485,7 @@ impl<M: PlanMemory + ?Sized> Evaluation<'_, M> {
         }
         let mut bytes = [0; 8];
         let len = width.bytes();
-        self.read(address, &mut bytes[..len])?;
+        self.read(address, ReadPurpose::Pointer, &mut bytes[..len])?;
         let pointer = decode_unsigned(&bytes[..len], self.context.byte_order);
         if pointer == 0 {
             return Err(EvaluationErrorCause::NullPointer);
@@ -670,6 +685,8 @@ fn decode_unsigned(bytes: &[u8], order: ByteOrder) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     const BASE: u64 = 0x1000;
@@ -686,6 +703,7 @@ mod tests {
         fn read_exact(
             &self,
             target_address: u64,
+            _purpose: ReadPurpose,
             destination: &mut [u8],
         ) -> Result<(), Self::Error> {
             let offset = target_address
@@ -696,6 +714,27 @@ mod tests {
                 .checked_add(destination.len())
                 .ok_or(TestMemoryError)?;
             destination.copy_from_slice(self.0.get(offset..end).ok_or(TestMemoryError)?);
+            Ok(())
+        }
+    }
+
+    struct TrackingMemory {
+        inner: TestMemory,
+        purposes: RefCell<Vec<ReadPurpose>>,
+    }
+
+    impl PlanMemory for TrackingMemory {
+        type Error = TestMemoryError;
+
+        fn read_exact(
+            &self,
+            target_address: u64,
+            purpose: ReadPurpose,
+            destination: &mut [u8],
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .read_exact(target_address, purpose, destination)?;
+            self.purposes.borrow_mut().push(purpose);
             Ok(())
         }
     }
@@ -761,6 +800,51 @@ mod tests {
             )
             .unwrap(),
             Value::Address(0x1234)
+        );
+    }
+
+    #[test]
+    fn identifies_each_memory_read_purpose() {
+        let mut bytes = vec![0; 13];
+        bytes[4..12].copy_from_slice(&(BASE + 12).to_le_bytes());
+        bytes[12] = 7;
+        let memory = TrackingMemory {
+            inner: TestMemory(bytes),
+            purposes: RefCell::new(Vec::new()),
+        };
+        let value = Plan::new(
+            ValueKind::Unsigned,
+            vec![
+                Step::X86ResolveRelative {
+                    displacement_offset: 0,
+                    width: SignedWidth::I32,
+                },
+                Step::ReadPointer {
+                    offset: 0,
+                    width: PointerWidth::U64,
+                },
+                Step::ReadUnsigned {
+                    offset: 0,
+                    width: IntegerWidth::U8,
+                },
+            ],
+        )
+        .evaluate(
+            &memory,
+            BASE,
+            context(TargetArchitecture::X86_64),
+            Limits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(value, Value::Unsigned(7));
+        assert_eq!(
+            *memory.purposes.borrow(),
+            [
+                ReadPurpose::Instruction,
+                ReadPurpose::Pointer,
+                ReadPurpose::Unsigned,
+            ]
         );
     }
 

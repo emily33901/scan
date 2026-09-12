@@ -12,9 +12,9 @@ pub use scan_plan::{
     ByteOrder, EvaluationError as PlanEvaluationError,
     EvaluationErrorCause as PlanEvaluationErrorCause, InstructionError,
     IntegerWidth as PlanIntegerWidth, Limits as PlanLimits, Operation as MethodOperation,
-    Operation as PlanOperation, Plan, PlanMemory, PointerWidth, SignedWidth, Step as PlanStep,
-    TargetArchitecture, TargetContext, Value as PlanValue, ValueKind as MethodValueKind,
-    ValueKind as PlanValueKind, SCHEMA_VERSION,
+    Operation as PlanOperation, Plan, PlanMemory, PointerWidth, ReadPurpose, SignedWidth,
+    Step as PlanStep, TargetArchitecture, TargetContext, Value as PlanValue,
+    ValueKind as MethodValueKind, ValueKind as PlanValueKind, SCHEMA_VERSION,
 };
 
 pub mod x86_64;
@@ -49,7 +49,12 @@ impl<'a, M: DirectMemoryAccess + ?Sized> DirectPlanMemory<'a, M> {
 impl<M: DirectMemoryAccess + ?Sized> PlanMemory for DirectPlanMemory<'_, M> {
     type Error = MemoryError;
 
-    fn read_exact(&self, target_address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
+    fn read_exact(
+        &self,
+        target_address: u64,
+        _purpose: ReadPurpose,
+        destination: &mut [u8],
+    ) -> Result<(), Self::Error> {
         let address = checked_address(target_address)?;
         self.memory.check_range(
             address.checked_range(destination.len())?,
@@ -80,7 +85,12 @@ impl<'a, 'scope, M: DirectMemoryAccess + ?Sized> ScopedPlanMemory<'a, 'scope, M>
 impl<M: DirectMemoryAccess + ?Sized> PlanMemory for ScopedPlanMemory<'_, '_, M> {
     type Error = MemoryError;
 
-    fn read_exact(&self, target_address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
+    fn read_exact(
+        &self,
+        target_address: u64,
+        _purpose: ReadPurpose,
+        destination: &mut [u8],
+    ) -> Result<(), Self::Error> {
         let address = checked_address(target_address)?;
         self.scope.check_range(
             address.checked_range(destination.len())?,
@@ -109,7 +119,12 @@ impl<'a, M: FaultContainedMemoryAccess + ?Sized> FaultContainedPlanMemory<'a, M>
 impl<M: FaultContainedMemoryAccess + ?Sized> PlanMemory for FaultContainedPlanMemory<'_, M> {
     type Error = MemoryError;
 
-    fn read_exact(&self, target_address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
+    fn read_exact(
+        &self,
+        target_address: u64,
+        _purpose: ReadPurpose,
+        destination: &mut [u8],
+    ) -> Result<(), Self::Error> {
         let address = checked_address(target_address)?;
         self.memory.check_range(
             address.checked_range(destination.len())?,
