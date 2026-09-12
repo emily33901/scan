@@ -1,6 +1,5 @@
-//! Bounded, backend-independent address-resolution plans.
+//! Live-memory adapters for portable address-resolution plans.
 
-use std::fmt;
 use std::mem::size_of;
 
 use thiserror::Error;
@@ -9,9 +8,128 @@ use crate::memory::{
     Access, Address, DirectMemoryAccess, DirectMemoryScope, FaultContainedMemoryAccess, MemoryError,
 };
 
-mod aarch64;
+pub use scan_plan::{
+    ByteOrder, EvaluationError as PlanEvaluationError,
+    EvaluationErrorCause as PlanEvaluationErrorCause, InstructionError,
+    IntegerWidth as PlanIntegerWidth, Limits as PlanLimits, Operation as MethodOperation,
+    Operation as PlanOperation, Plan, PlanMemory, PointerWidth, SignedWidth, Step as PlanStep,
+    TargetArchitecture, TargetContext, Value as PlanValue, ValueKind as MethodValueKind,
+    ValueKind as PlanValueKind, SCHEMA_VERSION,
+};
+
 pub mod x86_64;
 
+/// Adapts checked, direct access to [`PlanMemory`].
+///
+/// # Safety
+///
+/// For every address that the evaluated plan can derive, the complete range
+/// must remain mapped, readable, initialized, and synchronized until the plan
+/// finishes evaluating.
+pub struct DirectPlanMemory<'a, M: ?Sized> {
+    memory: &'a M,
+    max_regions_per_read: usize,
+}
+
+impl<'a, M: DirectMemoryAccess + ?Sized> DirectPlanMemory<'a, M> {
+    /// Creates a portable-plan adapter over direct process memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the type-level safety contract for every read
+    /// requested through this adapter.
+    pub const unsafe fn new(memory: &'a M, max_regions_per_read: usize) -> Self {
+        Self {
+            memory,
+            max_regions_per_read,
+        }
+    }
+}
+
+impl<M: DirectMemoryAccess + ?Sized> PlanMemory for DirectPlanMemory<'_, M> {
+    type Error = MemoryError;
+
+    fn read_exact(&self, target_address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
+        let address = checked_address(target_address)?;
+        self.memory.check_range(
+            address.checked_range(destination.len())?,
+            Access::READ,
+            self.max_regions_per_read,
+        )?;
+        // SAFETY: construction of this adapter delegates the direct-read
+        // contract to its caller, and the complete range was preflighted.
+        unsafe { self.memory.read_bytes_into(address, destination) }
+    }
+}
+
+/// Adapts a branded direct-memory scope to [`PlanMemory`].
+pub struct ScopedPlanMemory<'a, 'scope, M: ?Sized> {
+    scope: &'a DirectMemoryScope<'scope, M>,
+    max_regions_per_read: usize,
+}
+
+impl<'a, 'scope, M: DirectMemoryAccess + ?Sized> ScopedPlanMemory<'a, 'scope, M> {
+    pub const fn new(scope: &'a DirectMemoryScope<'scope, M>, max_regions_per_read: usize) -> Self {
+        Self {
+            scope,
+            max_regions_per_read,
+        }
+    }
+}
+
+impl<M: DirectMemoryAccess + ?Sized> PlanMemory for ScopedPlanMemory<'_, '_, M> {
+    type Error = MemoryError;
+
+    fn read_exact(&self, target_address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
+        let address = checked_address(target_address)?;
+        self.scope.check_range(
+            address.checked_range(destination.len())?,
+            Access::READ,
+            self.max_regions_per_read,
+        )?;
+        self.scope.read_bytes_into(address, destination)
+    }
+}
+
+/// Adapts fault-contained memory access to [`PlanMemory`].
+pub struct FaultContainedPlanMemory<'a, M: ?Sized> {
+    memory: &'a M,
+    max_regions_per_read: usize,
+}
+
+impl<'a, M: FaultContainedMemoryAccess + ?Sized> FaultContainedPlanMemory<'a, M> {
+    pub const fn new(memory: &'a M, max_regions_per_read: usize) -> Self {
+        Self {
+            memory,
+            max_regions_per_read,
+        }
+    }
+}
+
+impl<M: FaultContainedMemoryAccess + ?Sized> PlanMemory for FaultContainedPlanMemory<'_, M> {
+    type Error = MemoryError;
+
+    fn read_exact(&self, target_address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
+        let address = checked_address(target_address)?;
+        self.memory.check_range(
+            address.checked_range(destination.len())?,
+            Access::READ,
+            self.max_regions_per_read,
+        )?;
+        self.memory.try_read_bytes_into(address, destination)
+    }
+}
+
+fn checked_address(address: u64) -> Result<Address, MemoryError> {
+    usize::try_from(address)
+        .map(Address::new)
+        .map_err(|_| MemoryError::AddressOverflow)
+}
+
+/// Compatibility view of a method plan using scan's original step syntax.
+///
+/// Evaluation is performed as one [`scan_plan::Plan`], so all limits and
+/// instruction accounting apply across the complete plan.
 #[derive(Clone, Copy, Debug)]
 pub struct MethodPlan<'a> {
     steps: &'a [MethodStep],
@@ -36,8 +154,9 @@ impl<'a> MethodPlan<'a> {
         start: Address,
         limits: MethodLimits,
     ) -> Result<MethodValue, MethodError> {
-        let mut reader = DirectReader { memory };
-        evaluate(self.steps, &mut reader, start, limits)
+        // SAFETY: this method has the same contract as the adapter constructor.
+        let memory = unsafe { DirectPlanMemory::new(memory, limits.max_regions_per_read) };
+        self.evaluate(&memory, start, limits)
     }
 
     pub fn evaluate_scoped<M: DirectMemoryAccess + ?Sized>(
@@ -46,8 +165,11 @@ impl<'a> MethodPlan<'a> {
         start: Address,
         limits: MethodLimits,
     ) -> Result<MethodValue, MethodError> {
-        let mut reader = ScopedReader { scope };
-        evaluate(self.steps, &mut reader, start, limits)
+        self.evaluate(
+            &ScopedPlanMemory::new(scope, limits.max_regions_per_read),
+            start,
+            limits,
+        )
     }
 
     pub fn evaluate_fault_contained<M: FaultContainedMemoryAccess + ?Sized>(
@@ -56,8 +178,43 @@ impl<'a> MethodPlan<'a> {
         start: Address,
         limits: MethodLimits,
     ) -> Result<MethodValue, MethodError> {
-        let mut reader = FaultContainedReader { memory };
-        evaluate(self.steps, &mut reader, start, limits)
+        self.evaluate(
+            &FaultContainedPlanMemory::new(memory, limits.max_regions_per_read),
+            start,
+            limits,
+        )
+    }
+
+    fn evaluate<M: PlanMemory<Error = MemoryError> + ?Sized>(
+        self,
+        memory: &M,
+        start: Address,
+        limits: MethodLimits,
+    ) -> Result<MethodValue, MethodError> {
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        validate_architectures(self.steps)?;
+        let mut steps = Vec::with_capacity(self.steps.len());
+        for (step_index, step) in self.steps.iter().copied().enumerate() {
+            steps.push(step.to_plan_step().map_err(|cause| MethodError {
+                step_index,
+                operation: step.operation(),
+                cause,
+            })?);
+        }
+        let plan = Plan::new(inferred_result_kind(self.steps), steps);
+        let value = plan
+            .evaluate(
+                memory,
+                start.get() as u64,
+                native_target_context(),
+                limits.into_plan_limits(),
+            )
+            .map_err(MethodError::from_plan)?;
+        MethodValue::from_plan(value).ok_or(MethodError {
+            step_index: self.steps.len(),
+            operation: MethodOperation::Plan,
+            cause: MethodErrorCause::AddressOverflow,
+        })
     }
 }
 
@@ -108,6 +265,7 @@ impl MethodStep {
         }
     }
 
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     const fn required_architecture(self) -> Option<Architecture> {
         match self {
             Self::X86ResolveRelative { .. } | Self::X86FollowDirectBranch => {
@@ -117,11 +275,41 @@ impl MethodStep {
             | Self::Arm64ResolveImmediateRelative
             | Self::Arm64ResolvePageOffset { .. }
             | Self::Arm64FollowDirectBranch => Some(Architecture::Aarch64),
-            Self::Add(_)
-            | Self::ReadPointer { .. }
-            | Self::ReadUnsigned { .. }
-            | Self::UnsignedToAddress => None,
+            _ => None,
         }
+    }
+
+    fn to_plan_step(self) -> Result<PlanStep, MethodErrorCause> {
+        Ok(match self {
+            Self::Add(offset) => PlanStep::Add { offset },
+            Self::ReadPointer { offset } => PlanStep::ReadPointer {
+                offset,
+                width: native_pointer_width(),
+            },
+            Self::ReadUnsigned { offset, width } => PlanStep::ReadUnsigned {
+                offset,
+                width: width.to_plan_width(),
+            },
+            Self::UnsignedToAddress => PlanStep::UnsignedToAddress,
+            Self::X86ResolveRelative {
+                displacement_offset,
+                width,
+            } => PlanStep::X86ResolveRelative {
+                displacement_offset: u64::try_from(displacement_offset)
+                    .map_err(|_| MethodErrorCause::AddressOverflow)?,
+                width,
+            },
+            Self::X86FollowDirectBranch => PlanStep::X86FollowDirectBranch,
+            Self::Arm64ReadImmediate => PlanStep::Arm64ReadImmediate,
+            Self::Arm64ResolveImmediateRelative => PlanStep::Arm64ResolveImmediateRelative,
+            Self::Arm64ResolvePageOffset { instruction_offset } => {
+                PlanStep::Arm64ResolvePageOffset {
+                    instruction_offset: u64::try_from(instruction_offset)
+                        .map_err(|_| MethodErrorCause::AddressOverflow)?,
+                }
+            }
+            Self::Arm64FollowDirectBranch => PlanStep::Arm64FollowDirectBranch,
+        })
     }
 }
 
@@ -132,18 +320,8 @@ pub enum Architecture {
     Other,
 }
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 impl Architecture {
-    #[cfg(target_arch = "x86_64")]
-    const fn current() -> Self {
-        Self::X86_64
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    const fn current() -> Self {
-        Self::Aarch64
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     const fn current() -> Self {
         Self::Other
     }
@@ -158,20 +336,15 @@ pub enum IntegerWidth {
     Usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SignedWidth {
-    I32,
-    I64,
-}
-
 impl IntegerWidth {
-    const fn bytes(self) -> usize {
+    const fn to_plan_width(self) -> PlanIntegerWidth {
         match self {
-            Self::U8 => 1,
-            Self::U16 => 2,
-            Self::U32 => 4,
-            Self::U64 => 8,
-            Self::Usize => size_of::<usize>(),
+            Self::U8 => PlanIntegerWidth::U8,
+            Self::U16 => PlanIntegerWidth::U16,
+            Self::U32 => PlanIntegerWidth::U32,
+            Self::U64 => PlanIntegerWidth::U64,
+            Self::Usize if size_of::<usize>() == 4 => PlanIntegerWidth::U32,
+            Self::Usize => PlanIntegerWidth::U64,
         }
     }
 }
@@ -199,13 +372,14 @@ impl MethodValue {
             Self::Unsigned(_) => MethodValueKind::Unsigned,
         }
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MethodValueKind {
-    Address,
-    Signed,
-    Unsigned,
+    fn from_plan(value: PlanValue) -> Option<Self> {
+        match value {
+            PlanValue::Address(address) => checked_address(address).ok().map(Self::Address),
+            PlanValue::Signed(value) => Some(Self::Signed(value)),
+            PlanValue::Unsigned(value) => Some(Self::Unsigned(value)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,6 +387,17 @@ pub struct MethodLimits {
     pub max_steps: usize,
     pub max_instruction_bytes: usize,
     pub max_regions_per_read: usize,
+}
+
+impl MethodLimits {
+    const fn into_plan_limits(self) -> PlanLimits {
+        PlanLimits {
+            max_steps: self.max_steps,
+            max_instruction_bytes: self.max_instruction_bytes,
+            max_reads: usize::MAX,
+            max_read_bytes: usize::MAX,
+        }
+    }
 }
 
 impl Default for MethodLimits {
@@ -225,27 +410,6 @@ impl Default for MethodLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MethodOperation {
-    Plan,
-    Add,
-    ReadPointer,
-    ReadUnsigned,
-    UnsignedToAddress,
-    X86ResolveRelative,
-    X86FollowDirectBranch,
-    Arm64ReadImmediate,
-    Arm64ResolveImmediateRelative,
-    Arm64ResolvePageOffset,
-    Arm64FollowDirectBranch,
-}
-
-impl fmt::Display for MethodOperation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
 #[derive(Debug, Error)]
 #[error("method step {step_index} ({operation}) failed: {cause}")]
 pub struct MethodError {
@@ -255,6 +419,16 @@ pub struct MethodError {
     pub cause: MethodErrorCause,
 }
 
+impl MethodError {
+    fn from_plan(error: PlanEvaluationError<MemoryError>) -> Self {
+        Self {
+            step_index: error.step_index,
+            operation: error.operation,
+            cause: MethodErrorCause::from_plan(error.cause),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MethodErrorCause {
@@ -262,10 +436,30 @@ pub enum MethodErrorCause {
     StepLimitExceeded { actual: usize, limit: usize },
     #[error("instruction reads used {actual} bytes, exceeding limit {limit}")]
     InstructionByteLimitExceeded { actual: usize, limit: usize },
+    #[error("memory reads used {actual} operations, exceeding limit {limit}")]
+    ReadLimitExceeded { actual: usize, limit: usize },
+    #[error("memory reads used {actual} bytes, exceeding limit {limit}")]
+    ReadByteLimitExceeded { actual: usize, limit: usize },
     #[error("operation requires an address, but current value is {actual:?}")]
     AddressRequired { actual: MethodValueKind },
+    #[error("plan declares {expected:?}, but produced {actual:?}")]
+    ResultKindMismatch {
+        expected: MethodValueKind,
+        actual: MethodValueKind,
+    },
     #[error("address calculation overflowed")]
     AddressOverflow,
+    #[error("unsupported target context: {architecture:?}/{pointer_width:?}/{byte_order:?}")]
+    UnsupportedTargetContext {
+        architecture: TargetArchitecture,
+        pointer_width: PointerWidth,
+        byte_order: ByteOrder,
+    },
+    #[error("pointer width {width:?} does not match target width {target:?}")]
+    PointerWidthMismatch {
+        width: PointerWidth,
+        target: PointerWidth,
+    },
     #[error("operation requires {required:?}, but current architecture is {actual:?}")]
     UnsupportedArchitecture {
         required: Architecture,
@@ -275,329 +469,117 @@ pub enum MethodErrorCause {
     Memory(#[source] MemoryError),
     #[error("instruction decoding failed")]
     Instruction(#[source] InstructionError),
+    #[error("portable plan evaluation failed")]
+    Plan(#[source] PlanEvaluationErrorCause<MemoryError>),
 }
 
-#[derive(Debug, Error, Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum InstructionError {
-    #[error("instruction is truncated: expected {expected} bytes, got {actual}")]
-    Truncated { expected: usize, actual: usize },
-    #[error("unsupported instruction opcode {opcode:#010x}")]
-    UnsupportedOpcode { opcode: u32 },
-    #[error("ADRP destination x{adrp_destination} does not match pair base x{pair_base}")]
-    RegisterMismatch { adrp_destination: u8, pair_base: u8 },
-    #[error("register x{register} is invalid as {role}")]
-    InvalidRegister { register: u8, role: &'static str },
-    #[error("instruction address calculation overflowed")]
-    AddressOverflow,
-}
-
-trait MemoryReader {
-    fn check_read(
-        &self,
-        address: Address,
-        len: usize,
-        max_regions: usize,
-    ) -> Result<(), MemoryError>;
-    fn read_bytes(&mut self, address: Address, output: &mut [u8]) -> Result<(), MemoryError>;
-}
-
-struct DirectReader<'a, M: ?Sized> {
-    memory: &'a M,
-}
-
-impl<M: DirectMemoryAccess + ?Sized> MemoryReader for DirectReader<'_, M> {
-    fn check_read(
-        &self,
-        address: Address,
-        len: usize,
-        max_regions: usize,
-    ) -> Result<(), MemoryError> {
-        self.memory
-            .check_range(address.checked_range(len)?, Access::READ, max_regions)
-    }
-
-    fn read_bytes(&mut self, address: Address, output: &mut [u8]) -> Result<(), MemoryError> {
-        // SAFETY: only evaluate_direct constructs this adapter and delegates its
-        // contract to the caller.
-        unsafe { self.memory.read_bytes_into(address, output) }
-    }
-}
-
-struct ScopedReader<'a, 'scope, M: ?Sized> {
-    scope: &'a DirectMemoryScope<'scope, M>,
-}
-
-impl<M: DirectMemoryAccess + ?Sized> MemoryReader for ScopedReader<'_, '_, M> {
-    fn check_read(
-        &self,
-        address: Address,
-        len: usize,
-        max_regions: usize,
-    ) -> Result<(), MemoryError> {
-        self.scope
-            .check_range(address.checked_range(len)?, Access::READ, max_regions)
-    }
-
-    fn read_bytes(&mut self, address: Address, output: &mut [u8]) -> Result<(), MemoryError> {
-        self.scope.read_bytes_into(address, output)
-    }
-}
-
-struct FaultContainedReader<'a, M: ?Sized> {
-    memory: &'a M,
-}
-
-impl<M: FaultContainedMemoryAccess + ?Sized> MemoryReader for FaultContainedReader<'_, M> {
-    fn check_read(
-        &self,
-        address: Address,
-        len: usize,
-        max_regions: usize,
-    ) -> Result<(), MemoryError> {
-        self.memory
-            .check_range(address.checked_range(len)?, Access::READ, max_regions)
-    }
-
-    fn read_bytes(&mut self, address: Address, output: &mut [u8]) -> Result<(), MemoryError> {
-        self.memory.try_read_bytes_into(address, output)
-    }
-}
-
-struct Evaluation<'a, R: ?Sized> {
-    reader: &'a mut R,
-    limits: MethodLimits,
-    instruction_bytes: usize,
-}
-
-impl<R: MemoryReader + ?Sized> Evaluation<'_, R> {
-    fn read(&mut self, address: Address, output: &mut [u8]) -> Result<(), MethodErrorCause> {
-        self.reader
-            .check_read(address, output.len(), self.limits.max_regions_per_read)
-            .map_err(MethodErrorCause::Memory)?;
-        self.reader
-            .read_bytes(address, output)
-            .map_err(MethodErrorCause::Memory)
-    }
-
-    fn read_instruction(
-        &mut self,
-        address: Address,
-        output: &mut [u8],
-    ) -> Result<(), MethodErrorCause> {
-        let used = self.instruction_bytes.checked_add(output.len()).ok_or(
-            MethodErrorCause::InstructionByteLimitExceeded {
-                actual: usize::MAX,
-                limit: self.limits.max_instruction_bytes,
+impl MethodErrorCause {
+    fn from_plan(cause: PlanEvaluationErrorCause<MemoryError>) -> Self {
+        match cause {
+            PlanEvaluationErrorCause::StepLimitExceeded { actual, limit } => {
+                Self::StepLimitExceeded { actual, limit }
+            }
+            PlanEvaluationErrorCause::InstructionByteLimitExceeded { actual, limit } => {
+                Self::InstructionByteLimitExceeded { actual, limit }
+            }
+            PlanEvaluationErrorCause::ReadLimitExceeded { actual, limit } => {
+                Self::ReadLimitExceeded { actual, limit }
+            }
+            PlanEvaluationErrorCause::ReadByteLimitExceeded { actual, limit } => {
+                Self::ReadByteLimitExceeded { actual, limit }
+            }
+            PlanEvaluationErrorCause::AddressRequired { actual } => {
+                Self::AddressRequired { actual }
+            }
+            PlanEvaluationErrorCause::ResultKindMismatch { expected, actual } => {
+                Self::ResultKindMismatch { expected, actual }
+            }
+            PlanEvaluationErrorCause::AddressOverflow => Self::AddressOverflow,
+            PlanEvaluationErrorCause::UnsupportedTargetContext {
+                architecture,
+                pointer_width,
+                byte_order,
+            } => Self::UnsupportedTargetContext {
+                architecture,
+                pointer_width,
+                byte_order,
             },
-        )?;
-        if used > self.limits.max_instruction_bytes {
-            return Err(MethodErrorCause::InstructionByteLimitExceeded {
-                actual: used,
-                limit: self.limits.max_instruction_bytes,
-            });
-        }
-        self.read(address, output)?;
-        self.instruction_bytes = used;
-        Ok(())
-    }
-
-    fn read_u32_instruction(&mut self, address: Address) -> Result<u32, MethodErrorCause> {
-        let mut bytes = [0_u8; 4];
-        self.read_instruction(address, &mut bytes)?;
-        Ok(u32::from_le_bytes(bytes))
-    }
-
-    fn read_pointer(&mut self, address: Address) -> Result<Address, MethodErrorCause> {
-        let mut bytes = [0_u8; size_of::<usize>()];
-        self.read(address, &mut bytes)?;
-        Address::new(usize::from_ne_bytes(bytes))
-            .require_non_null()
-            .map_err(MethodErrorCause::Memory)
-    }
-
-    fn read_unsigned(
-        &mut self,
-        address: Address,
-        width: IntegerWidth,
-    ) -> Result<u64, MethodErrorCause> {
-        let mut bytes = [0_u8; 8];
-        self.read(address, &mut bytes[..width.bytes()])?;
-        Ok(match width {
-            IntegerWidth::U8 => u64::from(bytes[0]),
-            IntegerWidth::U16 => u64::from(u16::from_ne_bytes([bytes[0], bytes[1]])),
-            IntegerWidth::U32 => {
-                u64::from(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            PlanEvaluationErrorCause::NullPointer => Self::Memory(MemoryError::NullAddress),
+            PlanEvaluationErrorCause::PointerWidthMismatch { width, target } => {
+                Self::PointerWidthMismatch { width, target }
             }
-            IntegerWidth::U64 => u64::from_ne_bytes(bytes),
-            IntegerWidth::Usize => {
-                let mut native = [0_u8; size_of::<usize>()];
-                native.copy_from_slice(&bytes[..size_of::<usize>()]);
-                usize::from_ne_bytes(native) as u64
-            }
-        })
-    }
-
-    fn read_x86_branch(&mut self, address: Address) -> Result<([u8; 6], usize), MethodErrorCause> {
-        let mut bytes = [0_u8; 6];
-        self.read_instruction(address, &mut bytes[..1])?;
-        let known = if bytes[0] == 0x0f {
-            self.read_instruction(checked_add(address, 1)?, &mut bytes[1..2])?;
-            2
-        } else {
-            1
-        };
-        let length = x86_64::direct_branch_length(&bytes[..known])?;
-        self.read_instruction(checked_add(address, known)?, &mut bytes[known..length])?;
-        Ok((bytes, length))
-    }
-}
-
-fn evaluate<R: MemoryReader + ?Sized>(
-    steps: &[MethodStep],
-    reader: &mut R,
-    start: Address,
-    limits: MethodLimits,
-) -> Result<MethodValue, MethodError> {
-    if steps.len() > limits.max_steps {
-        return Err(MethodError {
-            step_index: limits.max_steps,
-            operation: MethodOperation::Plan,
-            cause: MethodErrorCause::StepLimitExceeded {
-                actual: steps.len(),
-                limit: limits.max_steps,
-            },
-        });
-    }
-    let mut evaluation = Evaluation {
-        reader,
-        limits,
-        instruction_bytes: 0,
-    };
-    let mut value = MethodValue::Address(start);
-    for (step_index, step) in steps.iter().copied().enumerate() {
-        let operation = step.operation();
-        value = evaluate_step(&mut evaluation, value, step).map_err(|cause| MethodError {
-            step_index,
-            operation,
-            cause,
-        })?;
-    }
-    Ok(value)
-}
-
-fn evaluate_step<R: MemoryReader + ?Sized>(
-    evaluation: &mut Evaluation<'_, R>,
-    value: MethodValue,
-    step: MethodStep,
-) -> Result<MethodValue, MethodErrorCause> {
-    if let Some(required) = step.required_architecture() {
-        let actual = Architecture::current();
-        if actual != required {
-            return Err(MethodErrorCause::UnsupportedArchitecture { required, actual });
-        }
-    }
-
-    let address = match step {
-        MethodStep::UnsignedToAddress => {
-            return match value {
-                MethodValue::Unsigned(value) => usize::try_from(value)
-                    .map(Address::new)
-                    .map(MethodValue::Address)
-                    .map_err(|_| MethodErrorCause::AddressOverflow),
-                other => Err(MethodErrorCause::AddressRequired {
-                    actual: other.kind(),
-                }),
-            }
-        }
-        _ => value
-            .into_address()
-            .map_err(|actual| MethodErrorCause::AddressRequired { actual })?,
-    };
-    match step {
-        MethodStep::Add(offset) => Ok(MethodValue::Address(checked_add_signed(address, offset)?)),
-        MethodStep::ReadPointer { offset } => Ok(MethodValue::Address(
-            evaluation.read_pointer(checked_add_signed(address, offset)?)?,
-        )),
-        MethodStep::ReadUnsigned { offset, width } => Ok(MethodValue::Unsigned(
-            evaluation.read_unsigned(checked_add_signed(address, offset)?, width)?,
-        )),
-        MethodStep::X86ResolveRelative {
-            displacement_offset,
-            width,
-        } => {
-            let displacement_address = checked_add(address, displacement_offset)?;
-            let (displacement, encoded_width) = match width {
-                SignedWidth::I32 => {
-                    let mut bytes = [0_u8; 4];
-                    evaluation.read_instruction(displacement_address, &mut bytes)?;
-                    (i64::from(i32::from_le_bytes(bytes)), 4)
+            PlanEvaluationErrorCause::UnsupportedArchitecture { required, actual } => {
+                Self::UnsupportedArchitecture {
+                    required: architecture_from_plan(required),
+                    actual: architecture_from_plan(actual),
                 }
-                SignedWidth::I64 => {
-                    let mut bytes = [0_u8; 8];
-                    evaluation.read_instruction(displacement_address, &mut bytes)?;
-                    (i64::from_le_bytes(bytes), 8)
-                }
-            };
-            Ok(MethodValue::Address(x86_64::relative_target(
-                address,
-                displacement_offset
-                    .checked_add(encoded_width)
-                    .ok_or(MethodErrorCause::AddressOverflow)?,
-                displacement,
-            )?))
+            }
+            PlanEvaluationErrorCause::Memory(error) => Self::Memory(error),
+            PlanEvaluationErrorCause::Instruction(error) => Self::Instruction(error),
+            other => Self::Plan(other),
         }
-        MethodStep::X86FollowDirectBranch => {
-            let (bytes, length) = evaluation.read_x86_branch(address)?;
-            Ok(MethodValue::Address(x86_64::direct_branch_target(
-                address,
-                &bytes[..length],
-            )?))
-        }
-        MethodStep::Arm64ReadImmediate => Ok(MethodValue::Signed(aarch64::instruction_immediate(
-            evaluation.read_u32_instruction(address)?,
-        )?)),
-        MethodStep::Arm64ResolveImmediateRelative => {
-            let immediate =
-                aarch64::instruction_immediate(evaluation.read_u32_instruction(address)?)?;
-            Ok(MethodValue::Address(checked_add_signed(
-                address, immediate,
-            )?))
-        }
-        MethodStep::Arm64ResolvePageOffset { instruction_offset } => {
-            let first_address = checked_add(address, instruction_offset)?;
-            let first = evaluation.read_u32_instruction(first_address)?;
-            let second = evaluation.read_u32_instruction(checked_add(first_address, 4)?)?;
-            Ok(MethodValue::Address(aarch64::page_pair_target(
-                first_address,
-                first,
-                second,
-            )?))
-        }
-        MethodStep::Arm64FollowDirectBranch => Ok(MethodValue::Address(
-            aarch64::direct_branch_target(address, evaluation.read_u32_instruction(address)?)?,
-        )),
-        MethodStep::UnsignedToAddress => Err(MethodErrorCause::AddressRequired {
-            actual: value.kind(),
-        }),
     }
-}
-
-fn checked_add(address: Address, offset: usize) -> Result<Address, MethodErrorCause> {
-    address
-        .checked_add(offset)
-        .map_err(|_| MethodErrorCause::AddressOverflow)
-}
-
-fn checked_add_signed(address: Address, offset: i64) -> Result<Address, MethodErrorCause> {
-    address
-        .checked_add_signed(offset)
-        .map_err(|_| MethodErrorCause::AddressOverflow)
 }
 
 impl From<InstructionError> for MethodErrorCause {
     fn from(source: InstructionError) -> Self {
         Self::Instruction(source)
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn validate_architectures(steps: &[MethodStep]) -> Result<(), MethodError> {
+    let actual = Architecture::current();
+    for (step_index, step) in steps.iter().copied().enumerate() {
+        if let Some(required) = step.required_architecture() {
+            if actual != required {
+                return Err(MethodError {
+                    step_index,
+                    operation: step.operation(),
+                    cause: MethodErrorCause::UnsupportedArchitecture { required, actual },
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inferred_result_kind(steps: &[MethodStep]) -> PlanValueKind {
+    steps
+        .last()
+        .map_or(PlanValueKind::Address, |step| match step {
+            MethodStep::ReadUnsigned { .. } => PlanValueKind::Unsigned,
+            MethodStep::Arm64ReadImmediate => PlanValueKind::Signed,
+            _ => PlanValueKind::Address,
+        })
+}
+
+const fn native_pointer_width() -> PointerWidth {
+    if size_of::<usize>() == 4 {
+        PointerWidth::U32
+    } else {
+        PointerWidth::U64
+    }
+}
+
+const fn native_target_context() -> TargetContext {
+    TargetContext {
+        #[cfg(target_arch = "aarch64")]
+        architecture: TargetArchitecture::Aarch64,
+        #[cfg(not(target_arch = "aarch64"))]
+        architecture: TargetArchitecture::X86_64,
+        pointer_width: native_pointer_width(),
+        #[cfg(target_endian = "little")]
+        byte_order: ByteOrder::Little,
+        #[cfg(target_endian = "big")]
+        byte_order: ByteOrder::Big,
+    }
+}
+
+const fn architecture_from_plan(architecture: TargetArchitecture) -> Architecture {
+    match architecture {
+        TargetArchitecture::X86_64 => Architecture::X86_64,
+        TargetArchitecture::Aarch64 => Architecture::Aarch64,
     }
 }
 
@@ -655,26 +637,6 @@ mod tests {
         assert_eq!(
             evaluate_fault(&[0xeb, 0xfe], &[MethodStep::X86FollowDirectBranch]).unwrap(),
             MethodValue::Address(BASE)
-        );
-    }
-
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    fn arm_page_pair_applies_the_plan_offset() {
-        let adrp_x3 = 0x9000_0003_u32;
-        let add_x3_x3_20 = 0x9100_5063_u32;
-        let mut bytes = vec![0; 12];
-        bytes[4..8].copy_from_slice(&adrp_x3.to_le_bytes());
-        bytes[8..12].copy_from_slice(&add_x3_x3_20.to_le_bytes());
-        assert_eq!(
-            evaluate_fault(
-                &bytes,
-                &[MethodStep::Arm64ResolvePageOffset {
-                    instruction_offset: 4,
-                }],
-            )
-            .unwrap(),
-            MethodValue::Address(Address::new(0x1014))
         );
     }
 
@@ -755,21 +717,6 @@ mod tests {
             ));
         }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            let limits = MethodLimits {
-                max_instruction_bytes: 1,
-                ..MethodLimits::default()
-            };
-            let error = MethodPlan::new(&[MethodStep::Arm64ReadImmediate])
-                .evaluate_fault_contained(&memory(&[0; 4]), BASE, limits)
-                .unwrap_err();
-            assert!(matches!(
-                error.cause,
-                MethodErrorCause::InstructionByteLimitExceeded { .. }
-            ));
-        }
-
         let error = evaluate_fault(
             &[1],
             &[
@@ -843,5 +790,59 @@ mod tests {
             error.cause,
             MethodErrorCause::Memory(MemoryError::RegionLimitExceeded { limit: 1 })
         ));
+    }
+
+    #[test]
+    fn canonical_plan_uses_fault_contained_adapter() {
+        let plan = Plan::new(
+            PlanValueKind::Unsigned,
+            vec![PlanStep::ReadUnsigned {
+                offset: 0,
+                width: PlanIntegerWidth::U16,
+            }],
+        );
+        assert_eq!(
+            plan.evaluate(
+                &FaultContainedPlanMemory::new(&memory(&[0x34, 0x12]), 1),
+                BASE.get() as u64,
+                native_target_context(),
+                PlanLimits::default(),
+            )
+            .unwrap(),
+            PlanValue::Unsigned(0x1234)
+        );
+    }
+
+    #[test]
+    fn canonical_plan_uses_direct_and_scoped_adapters() {
+        use crate::memory::with_direct_memory_scope;
+
+        let memory = memory(&[0x34, 0x12]);
+        let plan = Plan::new(
+            PlanValueKind::Unsigned,
+            vec![PlanStep::ReadUnsigned {
+                offset: 0,
+                width: PlanIntegerWidth::U16,
+            }],
+        );
+        let evaluate = |memory: &dyn PlanMemory<Error = MemoryError>| {
+            plan.evaluate(
+                memory,
+                BASE.get() as u64,
+                native_target_context(),
+                PlanLimits::default(),
+            )
+            .unwrap()
+        };
+
+        // SAFETY: FakeMemory owns stable initialized storage for the evaluation.
+        let direct = unsafe { DirectPlanMemory::new(&memory, 1) };
+        assert_eq!(evaluate(&direct), PlanValue::Unsigned(0x1234));
+
+        // SAFETY: FakeMemory owns stable initialized storage for the scope.
+        let scoped = unsafe {
+            with_direct_memory_scope(&memory, |scope| evaluate(&ScopedPlanMemory::new(scope, 1)))
+        };
+        assert_eq!(scoped, PlanValue::Unsigned(0x1234));
     }
 }

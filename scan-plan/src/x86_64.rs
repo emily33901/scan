@@ -2,7 +2,8 @@
 
 use crate::InstructionError;
 
-pub(crate) fn direct_branch_target(
+/// Resolves a supported direct branch from its instruction bytes.
+pub fn direct_branch_target(
     instruction_address: u64,
     bytes: &[u8],
 ) -> Result<u64, InstructionError> {

@@ -14,6 +14,9 @@ pub mod method;
 pub mod module;
 pub mod vtable;
 
+/// The canonical, portable plan model and evaluator.
+pub use scan_plan;
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 

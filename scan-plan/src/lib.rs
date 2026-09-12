@@ -1,7 +1,7 @@
 //! Portable, bounded evaluation of typed binary address-resolution plans.
 
 mod aarch64;
-mod x86_64;
+pub mod x86_64;
 
 use std::error::Error as StdError;
 use std::fmt;
