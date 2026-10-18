@@ -134,6 +134,28 @@ pub enum SignedWidth {
     I64,
 }
 
+/// Width of a signed scalar read (distinct from legacy relative displacements).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignedIntegerWidth {
+    I8,
+    I16,
+    I32,
+    I64,
+}
+
+impl SignedIntegerWidth {
+    const fn bytes(self) -> usize {
+        match self {
+            Self::I8 => 1,
+            Self::I16 => 2,
+            Self::I32 => 4,
+            Self::I64 => 8,
+        }
+    }
+}
+
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
     feature = "serde",
@@ -153,10 +175,22 @@ pub enum Step {
         offset: i64,
         width: IntegerWidth,
     },
+    /// Reads a target-endian scalar and sign extends it to i64.
+    ReadSigned {
+        offset: i64,
+        width: SignedIntegerWidth,
+    },
     UnsignedToAddress,
+    /// Legacy resolver whose origin is the end of the displacement field.
     X86ResolveRelative {
         displacement_offset: u64,
         width: SignedWidth,
+    },
+    /// Resolves a decoded RIP-relative disp32 from the end of the instruction.
+    /// The caller supplies validated decoder metadata; this does not decode an opcode.
+    X86ResolvePcRelative {
+        displacement_offset: u64,
+        instruction_length: u64,
     },
     X86FollowDirectBranch,
     Arm64ReadImmediate,
@@ -173,8 +207,10 @@ impl Step {
             Self::Add { .. } => Operation::Add,
             Self::ReadPointer { .. } => Operation::ReadPointer,
             Self::ReadUnsigned { .. } => Operation::ReadUnsigned,
+            Self::ReadSigned { .. } => Operation::ReadSigned,
             Self::UnsignedToAddress => Operation::UnsignedToAddress,
             Self::X86ResolveRelative { .. } => Operation::X86ResolveRelative,
+            Self::X86ResolvePcRelative { .. } => Operation::X86ResolvePcRelative,
             Self::X86FollowDirectBranch => Operation::X86FollowDirectBranch,
             Self::Arm64ReadImmediate => Operation::Arm64ReadImmediate,
             Self::Arm64ResolveImmediateRelative => Operation::Arm64ResolveImmediateRelative,
@@ -185,9 +221,9 @@ impl Step {
 
     const fn required_architecture(self) -> Option<TargetArchitecture> {
         match self {
-            Self::X86ResolveRelative { .. } | Self::X86FollowDirectBranch => {
-                Some(TargetArchitecture::X86_64)
-            }
+            Self::X86ResolveRelative { .. }
+            | Self::X86ResolvePcRelative { .. }
+            | Self::X86FollowDirectBranch => Some(TargetArchitecture::X86_64),
             Self::Arm64ReadImmediate
             | Self::Arm64ResolveImmediateRelative
             | Self::Arm64ResolvePageOffset { .. }
@@ -262,6 +298,7 @@ pub enum ReadPurpose {
     Instruction,
     Pointer,
     Unsigned,
+    Signed,
 }
 
 /// Checked access to bytes in the target's virtual address space.
@@ -301,8 +338,10 @@ pub enum Operation {
     Add,
     ReadPointer,
     ReadUnsigned,
+    ReadSigned,
     UnsignedToAddress,
     X86ResolveRelative,
+    X86ResolvePcRelative,
     X86FollowDirectBranch,
     Arm64ReadImmediate,
     Arm64ResolveImmediateRelative,
@@ -345,6 +384,11 @@ pub enum EvaluationErrorCause<E: StdError + 'static> {
     },
     #[error("address calculation overflowed")]
     AddressOverflow,
+    #[error("disp32 at offset {displacement_offset} is outside x86 instruction length {instruction_length} (1..=15)")]
+    InvalidPcRelativeField {
+        displacement_offset: u64,
+        instruction_length: u64,
+    },
     #[error("unsupported target context: {architecture:?}/{pointer_width:?}/{byte_order:?}")]
     UnsupportedTargetContext {
         architecture: TargetArchitecture,
@@ -512,6 +556,19 @@ impl<M: PlanMemory + ?Sized> Evaluation<'_, M> {
         Ok(pointer)
     }
 
+    fn read_signed(
+        &mut self,
+        address: u64,
+        width: SignedIntegerWidth,
+    ) -> Result<i64, EvaluationErrorCause<M::Error>> {
+        let mut bytes = [0; 8];
+        let len = width.bytes();
+        self.read(address, ReadPurpose::Signed, &mut bytes[..len])?;
+        let raw = decode_unsigned(&bytes[..len], self.context.byte_order);
+        let shift = (8 - len) * 8;
+        Ok(((raw << shift) as i64) >> shift)
+    }
+
     fn read_x86_branch(
         &mut self,
         address: u64,
@@ -611,6 +668,32 @@ fn evaluate_step<M: PlanMemory + ?Sized>(
         Step::ReadUnsigned { offset, width } => Ok(Value::Unsigned(
             evaluation.read_unsigned(checked_add_signed(address, offset)?, width)?,
         )),
+        Step::ReadSigned { offset, width } => Ok(Value::Signed(
+            evaluation.read_signed(checked_add_signed(address, offset)?, width)?,
+        )),
+        Step::X86ResolvePcRelative {
+            displacement_offset,
+            instruction_length,
+        } => {
+            if !(1..=15).contains(&instruction_length)
+                || displacement_offset
+                    .checked_add(4)
+                    .is_none_or(|end| end > instruction_length)
+            {
+                return Err(EvaluationErrorCause::InvalidPcRelativeField {
+                    displacement_offset,
+                    instruction_length,
+                });
+            }
+            // Validate the full instruction origin before accessing target memory.
+            let origin = checked_add(address, instruction_length)?;
+            let mut bytes = [0; 4];
+            evaluation.read_instruction(checked_add(address, displacement_offset)?, &mut bytes)?;
+            Ok(Value::Address(checked_add_signed(
+                origin,
+                i64::from(i32::from_le_bytes(bytes)),
+            )?))
+        }
         Step::X86ResolveRelative {
             displacement_offset,
             width,
@@ -786,6 +869,304 @@ mod tests {
             run(&[], TargetArchitecture::X86_64, ValueKind::Address, vec![]).unwrap(),
             Value::Address(BASE)
         );
+    }
+
+    #[test]
+    fn signed_reads_preserve_width_endianness_and_offsets() {
+        for (width, little) in [
+            (SignedIntegerWidth::I8, vec![0x80]),
+            (SignedIntegerWidth::I16, (-128_i16).to_le_bytes().to_vec()),
+            (SignedIntegerWidth::I32, (-128_i32).to_le_bytes().to_vec()),
+            (SignedIntegerWidth::I64, (-128_i64).to_le_bytes().to_vec()),
+        ] {
+            for byte_order in [ByteOrder::Little, ByteOrder::Big] {
+                let mut bytes = little.clone();
+                if byte_order == ByteOrder::Big {
+                    bytes.reverse();
+                }
+                bytes.insert(0, 0x90);
+                let memory = TrackingMemory {
+                    inner: TestMemory(bytes),
+                    purposes: RefCell::new(Vec::new()),
+                };
+                let plan = Plan::new(
+                    ValueKind::Signed,
+                    vec![Step::ReadSigned { offset: -1, width }],
+                );
+                assert_eq!(
+                    plan.evaluate(
+                        &memory,
+                        BASE + 2,
+                        TargetContext {
+                            byte_order,
+                            ..context(TargetArchitecture::X86_64)
+                        },
+                        Limits::default()
+                    )
+                    .unwrap(),
+                    Value::Signed(-128)
+                );
+                assert_eq!(*memory.purposes.borrow(), [ReadPurpose::Signed]);
+            }
+        }
+        for value in [i64::MIN, i64::MAX, 0, 1] {
+            assert_eq!(
+                run(
+                    &value.to_le_bytes(),
+                    TargetArchitecture::X86_64,
+                    ValueKind::Signed,
+                    vec![Step::ReadSigned {
+                        offset: 0,
+                        width: SignedIntegerWidth::I64
+                    }]
+                )
+                .unwrap(),
+                Value::Signed(value)
+            );
+        }
+    }
+
+    #[test]
+    fn pc_relative_origin_includes_trailing_immediate() {
+        // cmp dword ptr [rip-16], 1: displacement ends at byte 6, instruction at 7.
+        let bytes = [0x83, 0x3d, 0xf0, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(
+            run(
+                &bytes,
+                TargetArchitecture::X86_64,
+                ValueKind::Address,
+                vec![Step::X86ResolvePcRelative {
+                    displacement_offset: 2,
+                    instruction_length: 7
+                }]
+            )
+            .unwrap(),
+            Value::Address(BASE - 9)
+        );
+        assert_eq!(
+            run(
+                &bytes,
+                TargetArchitecture::X86_64,
+                ValueKind::Address,
+                vec![Step::X86ResolveRelative {
+                    displacement_offset: 2,
+                    width: SignedWidth::I32
+                }]
+            )
+            .unwrap(),
+            Value::Address(BASE - 10)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_pc_relative_fields_before_reading() {
+        for (displacement_offset, instruction_length) in [(0, 0), (0, 16), (3, 6), (u64::MAX, 7)] {
+            let error = run(
+                &[],
+                TargetArchitecture::X86_64,
+                ValueKind::Address,
+                vec![Step::X86ResolvePcRelative {
+                    displacement_offset,
+                    instruction_length,
+                }],
+            )
+            .unwrap_err();
+            assert_eq!(error.operation, Operation::X86ResolvePcRelative);
+            assert!(matches!(
+                error.cause,
+                EvaluationErrorCause::InvalidPcRelativeField { .. }
+            ));
+        }
+        let error = run(
+            &[],
+            TargetArchitecture::Aarch64,
+            ValueKind::Address,
+            vec![Step::X86ResolvePcRelative {
+                displacement_offset: 2,
+                instruction_length: 7,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.cause,
+            EvaluationErrorCause::UnsupportedArchitecture { .. }
+        ));
+        let error = run(
+            &[0; 5],
+            TargetArchitecture::X86_64,
+            ValueKind::Address,
+            vec![Step::X86ResolvePcRelative {
+                displacement_offset: 2,
+                instruction_length: 7,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error.cause, EvaluationErrorCause::Memory(_)));
+    }
+
+    #[test]
+    fn new_steps_check_address_arithmetic_and_value_kinds() {
+        for (start, step) in [
+            (
+                0,
+                Step::ReadSigned {
+                    offset: -1,
+                    width: SignedIntegerWidth::I8,
+                },
+            ),
+            (
+                u64::MAX,
+                Step::ReadSigned {
+                    offset: 0,
+                    width: SignedIntegerWidth::I32,
+                },
+            ),
+            (
+                u64::MAX - 3,
+                Step::X86ResolvePcRelative {
+                    displacement_offset: 0,
+                    instruction_length: 4,
+                },
+            ),
+        ] {
+            let error = Plan::new(ValueKind::Address, vec![step])
+                .evaluate(
+                    &TestMemory(vec![]),
+                    start,
+                    context(TargetArchitecture::X86_64),
+                    Limits::default(),
+                )
+                .unwrap_err();
+            assert!(matches!(error.cause, EvaluationErrorCause::AddressOverflow));
+        }
+        let error = run(
+            &i32::MIN.to_le_bytes(),
+            TargetArchitecture::X86_64,
+            ValueKind::Address,
+            vec![Step::X86ResolvePcRelative {
+                displacement_offset: 0,
+                instruction_length: 4,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error.cause, EvaluationErrorCause::AddressOverflow));
+        let read = Step::ReadSigned {
+            offset: 0,
+            width: SignedIntegerWidth::I8,
+        };
+        let error = run(
+            &[0xff],
+            TargetArchitecture::X86_64,
+            ValueKind::Signed,
+            vec![read, Step::Add { offset: 1 }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.cause,
+            EvaluationErrorCause::AddressRequired {
+                actual: ValueKind::Signed
+            }
+        ));
+        let error = run(
+            &[0xff],
+            TargetArchitecture::X86_64,
+            ValueKind::Unsigned,
+            vec![read],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.cause,
+            EvaluationErrorCause::ResultKindMismatch {
+                actual: ValueKind::Signed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn new_steps_obey_read_budgets() {
+        for step in [
+            Step::ReadSigned {
+                offset: 0,
+                width: SignedIntegerWidth::I32,
+            },
+            Step::X86ResolvePcRelative {
+                displacement_offset: 0,
+                instruction_length: 4,
+            },
+        ] {
+            for limits in [
+                Limits {
+                    max_reads: 0,
+                    ..Limits::default()
+                },
+                Limits {
+                    max_read_bytes: 3,
+                    ..Limits::default()
+                },
+            ] {
+                let error = run_with_limits(&[0; 4], vec![step], limits).unwrap_err();
+                assert!(matches!(
+                    error.cause,
+                    EvaluationErrorCause::ReadLimitExceeded { .. }
+                        | EvaluationErrorCause::ReadByteLimitExceeded { .. }
+                ));
+            }
+        }
+        let error = run_with_limits(
+            &[0; 4],
+            vec![Step::X86ResolvePcRelative {
+                displacement_offset: 0,
+                instruction_length: 4,
+            }],
+            Limits {
+                max_instruction_bytes: 3,
+                ..Limits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.cause,
+            EvaluationErrorCause::InstructionByteLimitExceeded { .. }
+        ));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn old_toml_and_new_action_round_trips_preserve_semantics() {
+        let old = "schema_version = 1\nresult = 'address'\n[[steps]]\naction = 'x86_resolve_relative'\ndisplacement_offset = 2\nwidth = 'i32'\n";
+        let plan: Plan = toml::from_str(old).unwrap();
+        assert_eq!(
+            plan.evaluate(
+                &TestMemory(vec![0x83, 0x3d, 0xf0, 0xff, 0xff, 0xff, 1]),
+                BASE,
+                context(TargetArchitecture::X86_64),
+                Limits::default()
+            )
+            .unwrap(),
+            Value::Address(BASE - 10)
+        );
+        for plan in [
+            Plan::new(
+                ValueKind::Signed,
+                vec![Step::ReadSigned {
+                    offset: -1,
+                    width: SignedIntegerWidth::I8,
+                }],
+            ),
+            Plan::new(
+                ValueKind::Address,
+                vec![Step::X86ResolvePcRelative {
+                    displacement_offset: 2,
+                    instruction_length: 7,
+                }],
+            ),
+        ] {
+            let encoded = toml::to_string(&plan).unwrap();
+            assert_eq!(toml::from_str::<Plan>(&encoded).unwrap(), plan);
+            let encoded = serde_json::to_string(&plan).unwrap();
+            assert_eq!(serde_json::from_str::<Plan>(&encoded).unwrap(), plan);
+        }
     }
 
     #[test]

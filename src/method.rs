@@ -12,8 +12,8 @@ pub use scan_plan::{
     ByteOrder, EvaluationError as PlanEvaluationError,
     EvaluationErrorCause as PlanEvaluationErrorCause, InstructionError,
     IntegerWidth as PlanIntegerWidth, Limits as PlanLimits, Operation as MethodOperation,
-    Operation as PlanOperation, Plan, PlanMemory, PointerWidth, ReadPurpose, SignedWidth,
-    Step as PlanStep, TargetArchitecture, TargetContext, Value as PlanValue,
+    Operation as PlanOperation, Plan, PlanMemory, PointerWidth, ReadPurpose, SignedIntegerWidth,
+    SignedWidth, Step as PlanStep, TargetArchitecture, TargetContext, Value as PlanValue,
     ValueKind as MethodValueKind, ValueKind as PlanValueKind, SCHEMA_VERSION,
 };
 
@@ -260,10 +260,18 @@ pub enum MethodStep {
         offset: i64,
         width: IntegerWidth,
     },
+    ReadSigned {
+        offset: i64,
+        width: SignedIntegerWidth,
+    },
     UnsignedToAddress,
     X86ResolveRelative {
         displacement_offset: usize,
         width: SignedWidth,
+    },
+    X86ResolvePcRelative {
+        displacement_offset: usize,
+        instruction_length: usize,
     },
     X86FollowDirectBranch,
     Arm64ReadImmediate,
@@ -280,8 +288,10 @@ impl MethodStep {
             Self::Add(_) => MethodOperation::Add,
             Self::ReadPointer { .. } => MethodOperation::ReadPointer,
             Self::ReadUnsigned { .. } => MethodOperation::ReadUnsigned,
+            Self::ReadSigned { .. } => MethodOperation::ReadSigned,
             Self::UnsignedToAddress => MethodOperation::UnsignedToAddress,
             Self::X86ResolveRelative { .. } => MethodOperation::X86ResolveRelative,
+            Self::X86ResolvePcRelative { .. } => MethodOperation::X86ResolvePcRelative,
             Self::X86FollowDirectBranch => MethodOperation::X86FollowDirectBranch,
             Self::Arm64ReadImmediate => MethodOperation::Arm64ReadImmediate,
             Self::Arm64ResolveImmediateRelative => MethodOperation::Arm64ResolveImmediateRelative,
@@ -293,9 +303,9 @@ impl MethodStep {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     const fn required_architecture(self) -> Option<Architecture> {
         match self {
-            Self::X86ResolveRelative { .. } | Self::X86FollowDirectBranch => {
-                Some(Architecture::X86_64)
-            }
+            Self::X86ResolveRelative { .. }
+            | Self::X86ResolvePcRelative { .. }
+            | Self::X86FollowDirectBranch => Some(Architecture::X86_64),
             Self::Arm64ReadImmediate
             | Self::Arm64ResolveImmediateRelative
             | Self::Arm64ResolvePageOffset { .. }
@@ -314,6 +324,16 @@ impl MethodStep {
             Self::ReadUnsigned { offset, width } => PlanStep::ReadUnsigned {
                 offset,
                 width: width.to_plan_width(),
+            },
+            Self::ReadSigned { offset, width } => PlanStep::ReadSigned { offset, width },
+            Self::X86ResolvePcRelative {
+                displacement_offset,
+                instruction_length,
+            } => PlanStep::X86ResolvePcRelative {
+                displacement_offset: u64::try_from(displacement_offset)
+                    .map_err(|_| MethodErrorCause::AddressOverflow)?,
+                instruction_length: u64::try_from(instruction_length)
+                    .map_err(|_| MethodErrorCause::AddressOverflow)?,
             },
             Self::UnsignedToAddress => PlanStep::UnsignedToAddress,
             Self::X86ResolveRelative {
@@ -574,7 +594,7 @@ fn inferred_result_kind(steps: &[MethodStep]) -> PlanValueKind {
         .last()
         .map_or(PlanValueKind::Address, |step| match step {
             MethodStep::ReadUnsigned { .. } => PlanValueKind::Unsigned,
-            MethodStep::Arm64ReadImmediate => PlanValueKind::Signed,
+            MethodStep::Arm64ReadImmediate | MethodStep::ReadSigned { .. } => PlanValueKind::Signed,
             _ => PlanValueKind::Address,
         })
 }
@@ -869,5 +889,63 @@ mod tests {
             with_direct_memory_scope(&memory, |scope| evaluate(&ScopedPlanMemory::new(scope, 1)))
         };
         assert_eq!(scoped, PlanValue::Unsigned(0x1234));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn new_steps_agree_across_adapters_and_method_plans() {
+        use crate::memory::with_direct_memory_scope;
+
+        let bytes = [0x83, 0x3d, 0xf0, 0xff, 0xff, 0xff, 0x01];
+        let memory = memory(&bytes);
+        for (step, result, expected) in [
+            (
+                MethodStep::ReadSigned {
+                    offset: 2,
+                    width: SignedIntegerWidth::I32,
+                },
+                PlanValueKind::Signed,
+                PlanValue::Signed(-16),
+            ),
+            (
+                MethodStep::X86ResolvePcRelative {
+                    displacement_offset: 2,
+                    instruction_length: 7,
+                },
+                PlanValueKind::Address,
+                PlanValue::Address(BASE.get() as u64 - 9),
+            ),
+        ] {
+            let plan = Plan::new(result, vec![step.to_plan_step().unwrap()]);
+            let evaluate = |memory: &dyn PlanMemory<Error = MemoryError>| {
+                plan.evaluate(
+                    memory,
+                    BASE.get() as u64,
+                    native_target_context(),
+                    PlanLimits::default(),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                evaluate(&FaultContainedPlanMemory::new(&memory, 1)),
+                expected
+            );
+            // SAFETY: FakeMemory owns stable initialized storage for all reads.
+            assert_eq!(
+                evaluate(&unsafe { DirectPlanMemory::new(&memory, 1) }),
+                expected
+            );
+            // SAFETY: FakeMemory owns stable initialized storage for the scope.
+            let scoped = unsafe {
+                with_direct_memory_scope(&memory, |scope| {
+                    evaluate(&ScopedPlanMemory::new(scope, 1))
+                })
+            };
+            assert_eq!(scoped, expected);
+            assert_eq!(
+                evaluate_fault(&bytes, &[step]).unwrap(),
+                MethodValue::from_plan(expected).unwrap()
+            );
+        }
     }
 }
