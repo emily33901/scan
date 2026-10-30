@@ -5,6 +5,8 @@
 //! heuristic used by the hook layer, but constrains it to one readable mapping
 //! and a hard cap. An explicit opt-in supports the MSVC layout where adjacent
 //! tables are separated by a non-executable RTTI word rather than a null.
+//! Callers with verified primary Itanium layouts can instead require an exact
+//! extent and its adjacent secondary-table metadata.
 
 use std::mem::size_of;
 
@@ -115,8 +117,9 @@ impl From<ExecutablePolicy> for VTableExecutablePolicy<'_> {
 /// The default remains a null word: it is the least permissive heuristic and
 /// preserves the historical hook behavior. MSVC vtables may instead be
 /// followed by a readable RTTI pointer, which is not executable. Callers that
-/// have verified that layout may opt into the second variant; it never accepts
-/// a non-executable requested slot.
+/// have verified that layout may opt into the non-executable variant. A verified
+/// primary Itanium extent uses its own metadata check. Neither accepts a
+/// non-executable requested slot.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum VTableTerminator {
@@ -126,6 +129,15 @@ pub enum VTableTerminator {
     /// A null entry, or the first non-executable entry strictly after the
     /// requested slot, terminates discovery.
     NullOrNonExecutableAfterRequestedSlot,
+    /// A caller-verified primary Itanium table extent, followed by the
+    /// secondary table's negative offset-to-top and matching RTTI pointer.
+    /// `slots` excludes those two metadata words. Both must fit `max_slots`.
+    /// The caller must prove this exact layout and the absence of an extended
+    /// ABI prefix. Nulls or invalid entries before the extent are errors.
+    ItaniumPrimaryTable {
+        slots: usize,
+        secondary_offset_to_top: isize,
+    },
 }
 
 /// Limits and validation policy for one discovery operation.
@@ -239,6 +251,8 @@ pub enum VTableError {
     },
     #[error("could not reserve owned storage for {requested} vtable words")]
     Allocation { requested: usize },
+    #[error("vtable does not match the verified primary Itanium layout at slot {slot}")]
+    ItaniumLayoutMismatch { slot: usize },
     #[error("vtable mapping boundary was reached at slot {slot} before a null terminator")]
     TerminatorMappingBoundary { slot: usize },
     #[error("vtable has no null terminator within its {max_slots}-slot limit")]
@@ -467,6 +481,38 @@ fn discover<R: VTableReader + ?Sized>(
         });
     }
 
+    let itanium_extent = match spec.terminator {
+        VTableTerminator::ItaniumPrimaryTable {
+            slots,
+            secondary_offset_to_top,
+        } => {
+            let mismatch = || VTableError::ItaniumLayoutMismatch { slot: slots };
+            if spec.abi != CxxAbi::Itanium64
+                || slots <= spec.slot
+                || slots.checked_add(2).is_none_or(|end| end > spec.max_slots)
+                || secondary_offset_to_top >= 0
+                || secondary_offset_to_top % pointer_size as isize != 0
+                || prefix[0] != 0
+                || prefix[1] == 0
+            {
+                return Err(mismatch());
+            }
+            let rtti = Address::new(prefix[1]);
+            let region = reader.region_containing(rtti).map_err(|_| mismatch())?;
+            let range = rtti
+                .checked_range(2 * pointer_size)
+                .map_err(|_| mismatch())?;
+            if !region.access.contains(Access::READ)
+                || region.access.contains(Access::EXECUTE)
+                || !region.range.contains_range(range)
+            {
+                return Err(mismatch());
+            }
+            Some((slots, secondary_offset_to_top as usize))
+        }
+        _ => None,
+    };
+
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(spec.max_slots)
@@ -498,6 +544,27 @@ fn discover<R: VTableReader + ?Sized>(
         }
 
         let entry = Address::new(reader.read_word(address, VTableRead::Entry { slot })?);
+        if let Some((slots, offset_to_top)) = itanium_extent {
+            if slot == slots {
+                let mismatch = || VTableError::ItaniumLayoutMismatch { slot };
+                let pair = address
+                    .checked_range(2 * pointer_size)
+                    .map_err(|_| mismatch())?;
+                if !table_region.range.contains_range(pair) {
+                    return Err(VTableError::TerminatorMappingBoundary { slot });
+                }
+                let next = address.checked_add(pointer_size).map_err(|_| mismatch())?;
+                let rtti = reader.read_word(next, VTableRead::Entry { slot: slot + 1 })?;
+                if entry.get() != offset_to_top || rtti != prefix[1] {
+                    return Err(mismatch());
+                }
+                terminated = true;
+                break;
+            }
+            if entry.is_null() {
+                return Err(VTableError::ItaniumLayoutMismatch { slot });
+            }
+        }
         if entry.is_null() {
             terminated = true;
             break;
@@ -1083,5 +1150,197 @@ mod tests {
             };
             assert!(matches!(error, VTableError::InvalidSlotLimit { .. }));
         }
+    }
+    fn itanium_fixture(entries: &[usize]) -> Fixture {
+        let mut fixture = Fixture::new(CxxAbi::Itanium64, entries, false, ModuleId(7));
+        fixture._layout[0] = 0;
+        fixture
+            .memory
+            .regions
+            .retain(|r| r.range.start().get() != 0xbbbb);
+        fixture.memory.regions.push(region(
+            Address::new(0xbbbb),
+            16,
+            Access::READ,
+            RegionKind::Private,
+            None,
+        ));
+        fixture
+    }
+
+    fn verified_itanium_spec(fixture: &Fixture, slot: usize, slots: usize) -> VTableSpec<'static> {
+        fixture.spec(CxxAbi::Itanium64, slot, 16).with_terminator(
+            VTableTerminator::ItaniumPrimaryTable {
+                slots,
+                secondary_offset_to_top: -40,
+            },
+        )
+    }
+
+    #[test]
+    fn verified_itanium_extent_preserves_prefix_and_functions() {
+        let functions = [
+            function_address(first_function),
+            function_address(second_function),
+        ];
+        let fixture = itanium_fixture(&[functions[0], functions[1], (-40isize) as usize, 0xbbbb]);
+        let found = unsafe {
+            discover_direct(
+                &fixture.memory,
+                fixture.object,
+                verified_itanium_spec(&fixture, 1, 2),
+            )
+            .unwrap()
+        };
+        assert_eq!(found.prefix(), &[0, 0xbbbb]);
+        assert_eq!(
+            found
+                .entries()
+                .iter()
+                .map(|e| e.address().get())
+                .collect::<Vec<_>>(),
+            functions
+        );
+    }
+
+    #[test]
+    fn verified_itanium_rejects_wrong_metadata_and_early_markers() {
+        let f = function_address(first_function);
+        for words in [
+            vec![f, f, (-48isize) as usize, 0xbbbb],
+            vec![f, f, (-40isize) as usize, 0xcccc],
+            vec![f, 0, (-40isize) as usize, 0xbbbb],
+            vec![f, f, usize::MAX - 8, 0xbbbb],
+        ] {
+            let fixture = itanium_fixture(&words);
+            assert!(unsafe {
+                discover_direct(
+                    &fixture.memory,
+                    fixture.object,
+                    verified_itanium_spec(&fixture, 0, 2),
+                )
+            }
+            .is_err());
+        }
+        // A structural-only search would accept this interior pair after slot 0.
+        // The verified extent requires executable entries through slot 3.
+        let mut fixture = itanium_fixture(&[
+            f,
+            (-40isize) as usize,
+            0xbbbb,
+            f,
+            (-40isize) as usize,
+            0xbbbb,
+        ]);
+        let structural_boundary = fixture._layout[2..].windows(2).position(|pair| {
+            (pair[0] as isize) < 0 && pair[0] % size_of::<usize>() == 0 && pair[1] == 0xbbbb
+        });
+        assert_eq!(structural_boundary, Some(1));
+        fixture
+            .memory
+            .regions
+            .retain(|r| r.range.start().get() != (-40isize) as usize);
+        assert!(matches!(
+            unsafe {
+                discover_direct(
+                    &fixture.memory,
+                    fixture.object,
+                    verified_itanium_spec(&fixture, 0, 4),
+                )
+            },
+            Err(VTableError::InvalidExecutable { slot: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn verified_itanium_rejects_requested_and_earlier_invalid_entries() {
+        let f = function_address(first_function);
+        for bad_slot in [0, 1] {
+            let mut words = [f, f, (-40isize) as usize, 0xbbbb];
+            words[bad_slot] = 0xdead;
+            let mut fixture = itanium_fixture(&words);
+            fixture
+                .memory
+                .regions
+                .retain(|r| r.range.start().get() != 0xdead);
+            assert!(
+                matches!(unsafe { discover_direct(&fixture.memory, fixture.object, verified_itanium_spec(&fixture, 1, 2)) }, Err(VTableError::InvalidExecutable { slot, .. }) if slot == bad_slot)
+            );
+        }
+    }
+
+    #[test]
+    fn verified_itanium_rejects_short_mapping_bad_prefix_and_foreign_policy() {
+        let f = function_address(first_function);
+        let fixture = itanium_fixture(&[f, f, (-40isize) as usize]);
+        assert!(matches!(
+            unsafe {
+                discover_direct(
+                    &fixture.memory,
+                    fixture.object,
+                    verified_itanium_spec(&fixture, 1, 2),
+                )
+            },
+            Err(VTableError::TerminatorMappingBoundary { .. })
+        ));
+        let mut fixture = itanium_fixture(&[f, f, (-40isize) as usize, 0xbbbb]);
+        fixture._layout[0] = 8;
+        assert!(unsafe {
+            discover_direct(
+                &fixture.memory,
+                fixture.object,
+                verified_itanium_spec(&fixture, 1, 2),
+            )
+        }
+        .is_err());
+        fixture._layout[0] = 0;
+        let module = loaded_module(
+            ModuleId(99),
+            AddressRange::new(Address::new(f + 256), 1).unwrap(),
+        );
+        let mut spec = verified_itanium_spec(&fixture, 1, 2);
+        spec.executable_policy = VTableExecutablePolicy::Module(&module);
+        assert!(matches!(
+            unsafe { discover_direct(&fixture.memory, fixture.object, spec) },
+            Err(VTableError::InvalidExecutable { slot: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn verified_itanium_rejects_bad_spec_and_rtti_mapping() {
+        let f = function_address(first_function);
+        let mut fixture = itanium_fixture(&[f, f, (-40isize) as usize, 0xbbbb]);
+        for (abi, slot, max_slots, offset) in [
+            (CxxAbi::Msvc64, 0, 16, -40),
+            (CxxAbi::Itanium64, 2, 16, -40),
+            (CxxAbi::Itanium64, 0, 3, -40),
+            (CxxAbi::Itanium64, 0, 16, 40),
+            (CxxAbi::Itanium64, 0, 16, -41),
+        ] {
+            let spec = fixture.spec(abi, slot, max_slots).with_terminator(
+                VTableTerminator::ItaniumPrimaryTable {
+                    slots: 2,
+                    secondary_offset_to_top: offset,
+                },
+            );
+            assert!(unsafe { discover_direct(&fixture.memory, fixture.object, spec) }.is_err());
+        }
+        let spec = verified_itanium_spec(&fixture, 0, 2);
+        fixture._layout[1] = 0;
+        assert!(unsafe { discover_direct(&fixture.memory, fixture.object, spec) }.is_err());
+        fixture._layout[1] = 0xbbbb;
+        fixture
+            .memory
+            .regions
+            .iter_mut()
+            .find(|r| r.range.start().get() == 0xbbbb)
+            .unwrap()
+            .access |= Access::EXECUTE;
+        assert!(unsafe { discover_direct(&fixture.memory, fixture.object, spec) }.is_err());
+        fixture
+            .memory
+            .regions
+            .retain(|r| r.range.start().get() != 0xbbbb);
+        assert!(unsafe { discover_direct(&fixture.memory, fixture.object, spec) }.is_err());
     }
 }
