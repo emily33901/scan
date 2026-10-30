@@ -261,11 +261,40 @@ fn inaccessible_page_and_cross_boundary_range_are_rejected() {
 
 #[test]
 fn released_page_is_reported_unmapped() {
+    #[cfg(target_os = "macos")]
+    {
+        const ISOLATED: &str = "SCAN_ISOLATED_UNMAPPED_PAGE_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            // After munmap, sibling tests and test-harness threads can reuse
+            // the address for mappings or stack guards. Query in a separate
+            // process running only this test, with no sibling test threads.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "released_page_is_reported_unmapped",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .expect("start isolated unmapped-page test");
+            assert!(
+                output.status.success(),
+                "isolated unmapped-page test failed ({}):\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+    }
+
     let address = ScratchPages::new(1).release();
-    assert!(matches!(
-        ProcessMemory::new().region_containing(address),
-        Err(MemoryError::Unmapped { address: rejected }) if rejected == address
-    ));
+    let result = ProcessMemory::new().region_containing(address);
+    assert!(
+        matches!(result, Err(MemoryError::Unmapped { address: rejected }) if rejected == address),
+        "released address {address:?}: {result:?}"
+    );
 }
 
 #[cfg(target_os = "windows")]
