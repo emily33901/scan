@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::function::{ExecutableAddress, ExecutablePolicy, FunctionError};
 use crate::memory::{
-    Access, Address, DirectMemoryAccess, DirectMemoryAccessExt, DirectMemoryScope,
+    Access, Address, AddressRange, DirectMemoryAccess, DirectMemoryAccessExt, DirectMemoryScope,
     FaultContainedMemoryAccess, FaultContainedMemoryAccessExt, MemoryError, MemoryRegion,
 };
 use crate::module::{LoadedModule, Section};
@@ -129,6 +129,9 @@ pub enum VTableTerminator {
     /// A null entry, or the first non-executable entry strictly after the
     /// requested slot, terminates discovery.
     NullOrNonExecutableAfterRequestedSlot,
+    /// The first word outside the supplied code section ends the table.
+    /// The requested slot must be among the preceding executable entries.
+    OutsideCodeSection(AddressRange),
     /// A caller-verified primary Itanium table extent, followed by the
     /// secondary table's negative offset-to-top and matching RTTI pointer.
     /// `slots` excludes those two metadata words. Both must fit `max_slots`.
@@ -563,6 +566,12 @@ fn discover<R: VTableReader + ?Sized>(
             }
             if entry.is_null() {
                 return Err(VTableError::ItaniumLayoutMismatch { slot });
+            }
+        }
+        if let VTableTerminator::OutsideCodeSection(code) = spec.terminator {
+            if !code.contains(entry) {
+                terminated = true;
+                break;
             }
         }
         if entry.is_null() {
@@ -1000,6 +1009,28 @@ mod tests {
         assert!(matches!(
             error,
             VTableError::InvalidExecutable { slot: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn code_section_bounds_the_table_before_validating_the_tail_word() {
+        let code = AddressRange::new(Address::new(0x1000), 0x1000).unwrap();
+        let entries = [0x1000, 0x1fff, 0x006e_0049_0070_006d];
+        let fixture = Fixture::new(CxxAbi::Msvc64, &entries, false, ModuleId(7));
+        let discover = |slot| unsafe {
+            discover_direct(
+                &fixture.memory,
+                fixture.object,
+                fixture
+                    .spec(CxxAbi::Msvc64, slot, 8)
+                    .with_terminator(VTableTerminator::OutsideCodeSection(code)),
+            )
+        };
+
+        assert_eq!(discover(1).unwrap().entries().len(), 2);
+        assert!(matches!(
+            discover(2),
+            Err(VTableError::SlotOutOfRange { slot: 2, len: 2 })
         ));
     }
 
