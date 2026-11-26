@@ -19,10 +19,19 @@ It reads only the displacement's four bytes, charged against instruction, read
 count, and read byte budgets. Instruction-end and target arithmetic are checked.
 
 The legacy `X86ResolveRelative` retains its displacement-field-end origin and
-existing `SignedWidth::{I32,I64}` contract. Existing schema 1 TOML/JSON plans remain
-readable and keep their original behavior. The new actions are additive schema 1
-variants (`read_signed` and `x86_resolve_pc_relative`); older readers reject these
-unknown actions rather than interpreting them as legacy relative operations.
+existing `SignedWidth::{I32,I64}` contract.
+
+Schema 2 encodes each step as a table keyed by operation name. Steps without
+operands take an empty table. For example:
+
+```toml
+schema_version = 2
+result = "address"
+steps = [
+    { read_unsigned = { offset = 0, width = "u64" } },
+    { unsigned_to_address = {} },
+]
+```
 
 Scan's `MethodStep` compatibility API exposes both new actions. Portable `Plan`
 evaluation and direct, scoped, and fault-contained memory adapters share the same

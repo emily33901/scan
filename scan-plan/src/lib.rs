@@ -9,7 +9,7 @@ use std::fmt;
 use thiserror::Error;
 
 /// The only schema version this crate writes or accepts.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Applies a recipe's signed match offset to a raw target address.
 pub fn apply_match_offset(raw_match: u64, match_offset: i64) -> Result<u64, MatchOffsetError> {
@@ -159,7 +159,7 @@ impl SignedIntegerWidth {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
     feature = "serde",
-    serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)
+    serde(rename_all = "snake_case", deny_unknown_fields)
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -180,6 +180,7 @@ pub enum Step {
         offset: i64,
         width: SignedIntegerWidth,
     },
+    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
     UnsignedToAddress,
     /// Legacy resolver whose origin is the end of the displacement field.
     X86ResolveRelative {
@@ -192,13 +193,34 @@ pub enum Step {
         displacement_offset: u64,
         instruction_length: u64,
     },
+    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
     X86FollowDirectBranch,
+    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
     Arm64ReadImmediate,
+    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
     Arm64ResolveImmediateRelative,
     Arm64ResolvePageOffset {
         instruction_offset: u64,
     },
+    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
     Arm64FollowDirectBranch,
+}
+
+#[cfg(feature = "serde")]
+mod empty_operands {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+
+    pub fn serialize<S: Serializer>(serializer: S) -> Result<S::Ok, S::Error> {
+        Empty {}.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+        Empty::deserialize(deserializer).map(|_| ())
+    }
 }
 
 impl Step {
@@ -1133,9 +1155,15 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
-    fn old_toml_and_new_action_round_trips_preserve_semantics() {
-        let old = "schema_version = 1\nresult = 'address'\n[[steps]]\naction = 'x86_resolve_relative'\ndisplacement_offset = 2\nwidth = 'i32'\n";
-        let plan: Plan = toml::from_str(old).unwrap();
+    fn one_key_toml_steps_round_trip_and_evaluate() {
+        let source = r#"schema_version = 2
+result = "address"
+steps = [
+    { x86_resolve_relative = { displacement_offset = 2, width = "i32" } },
+    { add = { offset = 0 } },
+]
+"#;
+        let plan: Plan = toml::from_str(source).unwrap();
         assert_eq!(
             plan.evaluate(
                 &TestMemory(vec![0x83, 0x3d, 0xf0, 0xff, 0xff, 0xff, 1]),
@@ -1439,19 +1467,19 @@ mod tests {
     #[test]
     fn serde_is_versioned_snake_case_and_strict() {
         let json = r#"{
-            "schema_version": 1,
+            "schema_version": 2,
             "result": "address",
-            "steps": [{"action":"x86_resolve_relative","displacement_offset":1,"width":"i32"}]
+            "steps": [{"x86_resolve_relative":{"displacement_offset":1,"width":"i32"}}]
         }"#;
         let plan: Plan = serde_json::from_str(json).unwrap();
         assert_eq!(plan.schema_version(), SCHEMA_VERSION);
         assert_eq!(
-            serde_json::to_value(&plan).unwrap()["steps"][0]["action"],
-            "x86_resolve_relative"
+            serde_json::to_value(&plan).unwrap()["steps"][0]["x86_resolve_relative"]["width"],
+            "i32"
         );
 
         for invalid in [
-            json.replace("\"schema_version\": 1", "\"schema_version\": 2"),
+            json.replace("\"schema_version\": 2", "\"schema_version\": 1"),
             json.replace(
                 "\"result\": \"address\"",
                 "\"result\": \"address\", \"extra\": true",
