@@ -161,9 +161,44 @@ impl SignedIntegerWidth {
     feature = "serde",
     serde(rename_all = "snake_case", deny_unknown_fields)
 )]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Assertion {
+    Aligned(usize),
+    IntegerRange {
+        min: i64,
+        max: i64,
+    },
+    Readable(usize),
+    Writable(usize),
+    Executable,
+    ModuleRange,
+    InstructionBoundary,
+    Section(String),
+    StringValue {
+        value: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        encoding: StringEncoding,
+    },
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+pub enum StringEncoding {
+    #[default]
+    Utf8,
+    Utf16Le,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(rename_all = "snake_case", deny_unknown_fields)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Step {
+    Assert(Assertion),
     Add {
         offset: i64,
     },
@@ -202,8 +237,9 @@ pub enum Step {
 }
 
 impl Step {
-    pub const fn operation(self) -> Operation {
+    pub const fn operation(&self) -> Operation {
         match self {
+            Self::Assert(_) => Operation::Assert,
             Self::Add { .. } => Operation::Add,
             Self::ReadPointer { .. } => Operation::ReadPointer,
             Self::ReadUnsigned { .. } => Operation::ReadUnsigned,
@@ -219,7 +255,7 @@ impl Step {
         }
     }
 
-    const fn required_architecture(self) -> Option<TargetArchitecture> {
+    const fn required_architecture(&self) -> Option<TargetArchitecture> {
         match self {
             Self::X86ResolveRelative { .. }
             | Self::X86ResolvePcRelative { .. }
@@ -305,6 +341,15 @@ pub enum ReadPurpose {
 pub trait PlanMemory {
     type Error: StdError + 'static;
 
+    /// Checks a predicate against the current value using the target memory context.
+    fn check_assertion(
+        &self,
+        _value: Value,
+        _assertion: &Assertion,
+    ) -> Result<(), EvaluationErrorCause<Self::Error>> {
+        Err(EvaluationErrorCause::UnsupportedAssertion)
+    }
+
     fn read_exact(
         &self,
         target_address: u64,
@@ -334,6 +379,7 @@ impl Default for Limits {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
+    Assert,
     Plan,
     Add,
     ReadPointer,
@@ -407,6 +453,8 @@ pub enum EvaluationErrorCause<E: StdError + 'static> {
         required: TargetArchitecture,
         actual: TargetArchitecture,
     },
+    #[error("target memory provider does not support this assertion")]
+    UnsupportedAssertion,
     #[error("memory access failed")]
     Memory(#[source] E),
     #[error("instruction decoding failed")]
@@ -616,7 +664,7 @@ pub fn evaluate<M: PlanMemory + ?Sized>(
         instruction_bytes: 0,
     };
     let mut value = Value::Address(start);
-    for (step_index, step) in plan.steps.iter().copied().enumerate() {
+    for (step_index, step) in plan.steps.iter().enumerate() {
         value = evaluate_step(&mut evaluation, value, step).map_err(|cause| EvaluationError {
             step_index,
             operation: step.operation(),
@@ -639,7 +687,7 @@ pub fn evaluate<M: PlanMemory + ?Sized>(
 fn evaluate_step<M: PlanMemory + ?Sized>(
     evaluation: &mut Evaluation<'_, M>,
     value: Value,
-    step: Step,
+    step: &Step,
 ) -> Result<Value, EvaluationErrorCause<M::Error>> {
     if let Some(required) = step.required_architecture() {
         if evaluation.context.architecture != required {
@@ -648,6 +696,10 @@ fn evaluate_step<M: PlanMemory + ?Sized>(
                 actual: evaluation.context.architecture,
             });
         }
+    }
+    if let Step::Assert(assertion) = step {
+        evaluation.memory.check_assertion(value, assertion)?;
+        return Ok(value);
     }
     if let Step::UnsignedToAddress {} = step {
         return match value {
@@ -660,7 +712,8 @@ fn evaluate_step<M: PlanMemory + ?Sized>(
     let address = value
         .into_address()
         .map_err(|actual| EvaluationErrorCause::AddressRequired { actual })?;
-    match step {
+    match *step {
+        Step::Assert(_) => unreachable!("handled above"),
         Step::Add { offset } => Ok(Value::Address(checked_add_signed(address, offset)?)),
         Step::ReadPointer { offset, width } => Ok(Value::Address(
             evaluation.read_pointer(checked_add_signed(address, offset)?, width)?,
@@ -802,6 +855,17 @@ mod tests {
     impl PlanMemory for TestMemory {
         type Error = TestMemoryError;
 
+        fn check_assertion(
+            &self,
+            value: Value,
+            assertion: &Assertion,
+        ) -> Result<(), EvaluationErrorCause<Self::Error>> {
+            match (value, assertion) {
+                (Value::Address(address), Assertion::ModuleRange) if address == BASE => Ok(()),
+                _ => Err(EvaluationErrorCause::Memory(TestMemoryError)),
+            }
+        }
+
         fn read_exact(
             &self,
             target_address: u64,
@@ -847,6 +911,20 @@ mod tests {
             pointer_width: PointerWidth::U64,
             byte_order: ByteOrder::Little,
         }
+    }
+
+    #[test]
+    fn inline_assertion_observes_current_value_before_next_step() {
+        let check = Step::Assert(Assertion::ModuleRange);
+        let add = Step::Add { offset: 1 };
+        let run = |steps| run(&[], TargetArchitecture::X86_64, ValueKind::Address, steps);
+        assert_eq!(
+            run(vec![check.clone(), add.clone()]).unwrap(),
+            Value::Address(BASE + 1)
+        );
+        let error = run(vec![add, check]).unwrap_err();
+        assert_eq!(error.step_index, 1);
+        assert_eq!(error.operation, Operation::Assert);
     }
 
     fn run(
@@ -1058,7 +1136,7 @@ mod tests {
             &[0xff],
             TargetArchitecture::X86_64,
             ValueKind::Signed,
-            vec![read, Step::Add { offset: 1 }],
+            vec![read.clone(), Step::Add { offset: 1 }],
         )
         .unwrap_err();
         assert!(matches!(
@@ -1105,7 +1183,7 @@ mod tests {
                     ..Limits::default()
                 },
             ] {
-                let error = run_with_limits(&[0; 4], vec![step], limits).unwrap_err();
+                let error = run_with_limits(&[0; 4], vec![step.clone()], limits).unwrap_err();
                 assert!(matches!(
                     error.cause,
                     EvaluationErrorCause::ReadLimitExceeded { .. }
