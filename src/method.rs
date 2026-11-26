@@ -335,7 +335,7 @@ impl MethodStep {
                 instruction_length: u64::try_from(instruction_length)
                     .map_err(|_| MethodErrorCause::AddressOverflow)?,
             },
-            Self::UnsignedToAddress => PlanStep::UnsignedToAddress,
+            Self::UnsignedToAddress => PlanStep::UnsignedToAddress {},
             Self::X86ResolveRelative {
                 displacement_offset,
                 width,
@@ -344,16 +344,16 @@ impl MethodStep {
                     .map_err(|_| MethodErrorCause::AddressOverflow)?,
                 width,
             },
-            Self::X86FollowDirectBranch => PlanStep::X86FollowDirectBranch,
-            Self::Arm64ReadImmediate => PlanStep::Arm64ReadImmediate,
-            Self::Arm64ResolveImmediateRelative => PlanStep::Arm64ResolveImmediateRelative,
+            Self::X86FollowDirectBranch => PlanStep::X86FollowDirectBranch {},
+            Self::Arm64ReadImmediate => PlanStep::Arm64ReadImmediate {},
+            Self::Arm64ResolveImmediateRelative => PlanStep::Arm64ResolveImmediateRelative {},
             Self::Arm64ResolvePageOffset { instruction_offset } => {
                 PlanStep::Arm64ResolvePageOffset {
                     instruction_offset: u64::try_from(instruction_offset)
                         .map_err(|_| MethodErrorCause::AddressOverflow)?,
                 }
             }
-            Self::Arm64FollowDirectBranch => PlanStep::Arm64FollowDirectBranch,
+            Self::Arm64FollowDirectBranch => PlanStep::Arm64FollowDirectBranch {},
         })
     }
 }

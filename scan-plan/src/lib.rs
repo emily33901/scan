@@ -180,8 +180,7 @@ pub enum Step {
         offset: i64,
         width: SignedIntegerWidth,
     },
-    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
-    UnsignedToAddress,
+    UnsignedToAddress {},
     /// Legacy resolver whose origin is the end of the displacement field.
     X86ResolveRelative {
         displacement_offset: u64,
@@ -193,34 +192,13 @@ pub enum Step {
         displacement_offset: u64,
         instruction_length: u64,
     },
-    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
-    X86FollowDirectBranch,
-    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
-    Arm64ReadImmediate,
-    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
-    Arm64ResolveImmediateRelative,
+    X86FollowDirectBranch {},
+    Arm64ReadImmediate {},
+    Arm64ResolveImmediateRelative {},
     Arm64ResolvePageOffset {
         instruction_offset: u64,
     },
-    #[cfg_attr(feature = "serde", serde(with = "empty_operands"))]
-    Arm64FollowDirectBranch,
-}
-
-#[cfg(feature = "serde")]
-mod empty_operands {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Empty {}
-
-    pub fn serialize<S: Serializer>(serializer: S) -> Result<S::Ok, S::Error> {
-        Empty {}.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
-        Empty::deserialize(deserializer).map(|_| ())
-    }
+    Arm64FollowDirectBranch {},
 }
 
 impl Step {
@@ -230,14 +208,14 @@ impl Step {
             Self::ReadPointer { .. } => Operation::ReadPointer,
             Self::ReadUnsigned { .. } => Operation::ReadUnsigned,
             Self::ReadSigned { .. } => Operation::ReadSigned,
-            Self::UnsignedToAddress => Operation::UnsignedToAddress,
+            Self::UnsignedToAddress {} => Operation::UnsignedToAddress,
             Self::X86ResolveRelative { .. } => Operation::X86ResolveRelative,
             Self::X86ResolvePcRelative { .. } => Operation::X86ResolvePcRelative,
-            Self::X86FollowDirectBranch => Operation::X86FollowDirectBranch,
-            Self::Arm64ReadImmediate => Operation::Arm64ReadImmediate,
-            Self::Arm64ResolveImmediateRelative => Operation::Arm64ResolveImmediateRelative,
+            Self::X86FollowDirectBranch {} => Operation::X86FollowDirectBranch,
+            Self::Arm64ReadImmediate {} => Operation::Arm64ReadImmediate,
+            Self::Arm64ResolveImmediateRelative {} => Operation::Arm64ResolveImmediateRelative,
             Self::Arm64ResolvePageOffset { .. } => Operation::Arm64ResolvePageOffset,
-            Self::Arm64FollowDirectBranch => Operation::Arm64FollowDirectBranch,
+            Self::Arm64FollowDirectBranch {} => Operation::Arm64FollowDirectBranch,
         }
     }
 
@@ -245,11 +223,11 @@ impl Step {
         match self {
             Self::X86ResolveRelative { .. }
             | Self::X86ResolvePcRelative { .. }
-            | Self::X86FollowDirectBranch => Some(TargetArchitecture::X86_64),
-            Self::Arm64ReadImmediate
-            | Self::Arm64ResolveImmediateRelative
+            | Self::X86FollowDirectBranch {} => Some(TargetArchitecture::X86_64),
+            Self::Arm64ReadImmediate {}
+            | Self::Arm64ResolveImmediateRelative {}
             | Self::Arm64ResolvePageOffset { .. }
-            | Self::Arm64FollowDirectBranch => Some(TargetArchitecture::Aarch64),
+            | Self::Arm64FollowDirectBranch {} => Some(TargetArchitecture::Aarch64),
             _ => None,
         }
     }
@@ -671,7 +649,7 @@ fn evaluate_step<M: PlanMemory + ?Sized>(
             });
         }
     }
-    if let Step::UnsignedToAddress = step {
+    if let Step::UnsignedToAddress {} = step {
         return match value {
             Value::Unsigned(value) => Ok(Value::Address(value)),
             other => Err(EvaluationErrorCause::AddressRequired {
@@ -742,17 +720,17 @@ fn evaluate_step<M: PlanMemory + ?Sized>(
                 displacement,
             )?))
         }
-        Step::X86FollowDirectBranch => {
+        Step::X86FollowDirectBranch {} => {
             let (bytes, length) = evaluation.read_x86_branch(address)?;
             Ok(Value::Address(x86_64::direct_branch_target(
                 address,
                 &bytes[..length],
             )?))
         }
-        Step::Arm64ReadImmediate => Ok(Value::Signed(aarch64::instruction_immediate(
+        Step::Arm64ReadImmediate {} => Ok(Value::Signed(aarch64::instruction_immediate(
             evaluation.read_u32_instruction(address)?,
         )?)),
-        Step::Arm64ResolveImmediateRelative => {
+        Step::Arm64ResolveImmediateRelative {} => {
             let immediate =
                 aarch64::instruction_immediate(evaluation.read_u32_instruction(address)?)?;
             Ok(Value::Address(checked_add_signed(address, immediate)?))
@@ -767,11 +745,11 @@ fn evaluate_step<M: PlanMemory + ?Sized>(
                 second,
             )?))
         }
-        Step::Arm64FollowDirectBranch => Ok(Value::Address(aarch64::direct_branch_target(
+        Step::Arm64FollowDirectBranch {} => Ok(Value::Address(aarch64::direct_branch_target(
             address,
             evaluation.read_u32_instruction(address)?,
         )?)),
-        Step::UnsignedToAddress => unreachable!("handled above"),
+        Step::UnsignedToAddress {} => unreachable!("handled above"),
     }
 }
 
@@ -1238,7 +1216,7 @@ steps = [
                         offset: 0,
                         width: IntegerWidth::U16,
                     },
-                    Step::UnsignedToAddress,
+                    Step::UnsignedToAddress {},
                 ],
             )
             .unwrap(),
@@ -1311,7 +1289,7 @@ steps = [
                 &0x97ff_ffff_u32.to_le_bytes(),
                 TargetArchitecture::Aarch64,
                 ValueKind::Address,
-                vec![Step::Arm64FollowDirectBranch],
+                vec![Step::Arm64FollowDirectBranch {}],
             )
             .unwrap(),
             Value::Address(0x0ffc)
@@ -1324,7 +1302,7 @@ steps = [
             &[0; 4],
             TargetArchitecture::X86_64,
             ValueKind::Signed,
-            vec![Step::Arm64ReadImmediate],
+            vec![Step::Arm64ReadImmediate {}],
         )
         .unwrap_err();
         assert!(matches!(
