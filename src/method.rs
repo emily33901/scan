@@ -13,7 +13,7 @@ pub use scan_plan::{
     EvaluationErrorCause as PlanEvaluationErrorCause, InstructionError,
     IntegerWidth as PlanIntegerWidth, Limits as PlanLimits, Operation as MethodOperation,
     Operation as PlanOperation, Plan, PlanMemory, PointerWidth, ReadPurpose, SignedIntegerWidth,
-    SignedWidth, Step as PlanStep, TargetArchitecture, TargetContext, Value as PlanValue,
+    Step as PlanStep, TargetArchitecture, TargetContext, Value as PlanValue,
     ValueKind as MethodValueKind, ValueKind as PlanValueKind, SCHEMA_VERSION,
 };
 
@@ -265,10 +265,6 @@ pub enum MethodStep {
         width: SignedIntegerWidth,
     },
     UnsignedToAddress,
-    X86ResolveRelative {
-        displacement_offset: usize,
-        width: SignedWidth,
-    },
     X86ResolvePcRelative {
         displacement_offset: usize,
         instruction_length: usize,
@@ -290,7 +286,6 @@ impl MethodStep {
             Self::ReadUnsigned { .. } => MethodOperation::ReadUnsigned,
             Self::ReadSigned { .. } => MethodOperation::ReadSigned,
             Self::UnsignedToAddress => MethodOperation::UnsignedToAddress,
-            Self::X86ResolveRelative { .. } => MethodOperation::X86ResolveRelative,
             Self::X86ResolvePcRelative { .. } => MethodOperation::X86ResolvePcRelative,
             Self::X86FollowDirectBranch => MethodOperation::X86FollowDirectBranch,
             Self::Arm64ReadImmediate => MethodOperation::Arm64ReadImmediate,
@@ -303,9 +298,9 @@ impl MethodStep {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     const fn required_architecture(self) -> Option<Architecture> {
         match self {
-            Self::X86ResolveRelative { .. }
-            | Self::X86ResolvePcRelative { .. }
-            | Self::X86FollowDirectBranch => Some(Architecture::X86_64),
+            Self::X86ResolvePcRelative { .. } | Self::X86FollowDirectBranch => {
+                Some(Architecture::X86_64)
+            }
             Self::Arm64ReadImmediate
             | Self::Arm64ResolveImmediateRelative
             | Self::Arm64ResolvePageOffset { .. }
@@ -336,14 +331,6 @@ impl MethodStep {
                     .map_err(|_| MethodErrorCause::AddressOverflow)?,
             },
             Self::UnsignedToAddress => PlanStep::UnsignedToAddress {},
-            Self::X86ResolveRelative {
-                displacement_offset,
-                width,
-            } => PlanStep::X86ResolveRelative {
-                displacement_offset: u64::try_from(displacement_offset)
-                    .map_err(|_| MethodErrorCause::AddressOverflow)?,
-                width,
-            },
             Self::X86FollowDirectBranch => PlanStep::X86FollowDirectBranch {},
             Self::Arm64ReadImmediate => PlanStep::Arm64ReadImmediate {},
             Self::Arm64ResolveImmediateRelative => PlanStep::Arm64ResolveImmediateRelative {},
@@ -666,9 +653,9 @@ mod tests {
         assert_eq!(
             evaluate_fault(
                 &(-8_i32).to_le_bytes(),
-                &[MethodStep::X86ResolveRelative {
+                &[MethodStep::X86ResolvePcRelative {
                     displacement_offset: 0,
-                    width: SignedWidth::I32,
+                    instruction_length: 4,
                 }]
             )
             .unwrap(),
@@ -750,9 +737,9 @@ mod tests {
                 max_instruction_bytes: 1,
                 ..MethodLimits::default()
             };
-            let error = MethodPlan::new(&[MethodStep::X86ResolveRelative {
+            let error = MethodPlan::new(&[MethodStep::X86ResolvePcRelative {
                 displacement_offset: 0,
-                width: SignedWidth::I32,
+                instruction_length: 4,
             }])
             .evaluate_fault_contained(&memory(&[0; 4]), BASE, limits)
             .unwrap_err();
@@ -825,9 +812,9 @@ mod tests {
             max_regions_per_read: 1,
             ..MethodLimits::default()
         };
-        let error = MethodPlan::new(&[MethodStep::X86ResolveRelative {
+        let error = MethodPlan::new(&[MethodStep::X86ResolvePcRelative {
             displacement_offset: 0,
-            width: SignedWidth::I32,
+            instruction_length: 4,
         }])
         .evaluate_fault_contained(&memory, BASE, limits)
         .unwrap_err();

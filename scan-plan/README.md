@@ -18,9 +18,6 @@ a validated decoder; this step does not validate instruction opcodes or operands
 It reads only the displacement's four bytes, charged against instruction, read
 count, and read byte budgets. Instruction-end and target arithmetic are checked.
 
-The legacy `X86ResolveRelative` retains its displacement-field-end origin and
-existing `SignedWidth::{I32,I64}` contract.
-
 Schema 2 encodes each step as a table keyed by operation name. Steps without
 operands take an empty table. For example:
 

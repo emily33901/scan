@@ -132,19 +132,9 @@
       "raw_match": 4096,
       "memory": [{ "address": 4097, "bytes": [246, 255, 255, 255] }],
       "plan": { "schema_version": 2, "result": "address", "steps": [
-        {"x86_resolve_relative": {"displacement_offset": 1, "width": "i32"}}
+        {"x86_resolve_pc_relative": {"displacement_offset": 1, "instruction_length": 5}}
       ] },
       "expected": { "outcome": "value", "kind": "address", "value": 4091 }
-    },
-    {
-      "name": "x86 rel64 is not narrowed",
-      "context": { "architecture": "x86_64", "pointer_width": "u64", "byte_order": "little" },
-      "raw_match": 4096,
-      "memory": [{ "address": 4096, "bytes": [240, 255, 255, 255, 255, 255, 255, 255] }],
-      "plan": { "schema_version": 2, "result": "address", "steps": [
-        {"x86_resolve_relative": {"displacement_offset": 0, "width": "i64"}}
-      ] },
-      "expected": { "outcome": "value", "kind": "address", "value": 4088 }
     },
     {
       "name": "x86 relative then pointer chain",
@@ -152,7 +142,7 @@
       "raw_match": 4096,
       "memory": [{ "address": 4096, "bytes": [232, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 86, 52, 18, 0, 0, 0, 0] }],
       "plan": { "schema_version": 2, "result": "address", "steps": [
-        {"x86_resolve_relative": {"displacement_offset": 1, "width": "i32"}},
+        {"x86_resolve_pc_relative": {"displacement_offset": 1, "instruction_length": 5}},
         {"read_pointer": {"offset": 0, "width": "u64"}}
       ] },
       "expected": { "outcome": "value", "kind": "address", "value": 305419896 }

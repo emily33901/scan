@@ -129,15 +129,6 @@ impl IntegerWidth {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SignedWidth {
-    I32,
-    I64,
-}
-
-/// Width of a signed scalar read (distinct from legacy relative displacements).
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignedIntegerWidth {
     I8,
     I16,
@@ -216,11 +207,6 @@ pub enum Step {
         width: SignedIntegerWidth,
     },
     UnsignedToAddress {},
-    /// Legacy resolver whose origin is the end of the displacement field.
-    X86ResolveRelative {
-        displacement_offset: u64,
-        width: SignedWidth,
-    },
     /// Resolves a decoded RIP-relative disp32 from the end of the instruction.
     /// The caller supplies validated decoder metadata; this does not decode an opcode.
     X86ResolvePcRelative {
@@ -245,7 +231,6 @@ impl Step {
             Self::ReadUnsigned { .. } => Operation::ReadUnsigned,
             Self::ReadSigned { .. } => Operation::ReadSigned,
             Self::UnsignedToAddress {} => Operation::UnsignedToAddress,
-            Self::X86ResolveRelative { .. } => Operation::X86ResolveRelative,
             Self::X86ResolvePcRelative { .. } => Operation::X86ResolvePcRelative,
             Self::X86FollowDirectBranch {} => Operation::X86FollowDirectBranch,
             Self::Arm64ReadImmediate {} => Operation::Arm64ReadImmediate,
@@ -257,9 +242,9 @@ impl Step {
 
     const fn required_architecture(&self) -> Option<TargetArchitecture> {
         match self {
-            Self::X86ResolveRelative { .. }
-            | Self::X86ResolvePcRelative { .. }
-            | Self::X86FollowDirectBranch {} => Some(TargetArchitecture::X86_64),
+            Self::X86ResolvePcRelative { .. } | Self::X86FollowDirectBranch {} => {
+                Some(TargetArchitecture::X86_64)
+            }
             Self::Arm64ReadImmediate {}
             | Self::Arm64ResolveImmediateRelative {}
             | Self::Arm64ResolvePageOffset { .. }
@@ -386,7 +371,6 @@ pub enum Operation {
     ReadUnsigned,
     ReadSigned,
     UnsignedToAddress,
-    X86ResolveRelative,
     X86ResolvePcRelative,
     X86FollowDirectBranch,
     Arm64ReadImmediate,
@@ -747,32 +731,6 @@ fn evaluate_step<M: PlanMemory + ?Sized>(
                 i64::from(i32::from_le_bytes(bytes)),
             )?))
         }
-        Step::X86ResolveRelative {
-            displacement_offset,
-            width,
-        } => {
-            let displacement_address = checked_add(address, displacement_offset)?;
-            let (displacement, encoded_width) = match width {
-                SignedWidth::I32 => {
-                    let mut bytes = [0; 4];
-                    evaluation.read_instruction(displacement_address, &mut bytes)?;
-                    (i64::from(i32::from_le_bytes(bytes)), 4)
-                }
-                SignedWidth::I64 => {
-                    let mut bytes = [0; 8];
-                    evaluation.read_instruction(displacement_address, &mut bytes)?;
-                    (i64::from_le_bytes(bytes), 8)
-                }
-            };
-            let end_offset = displacement_offset
-                .checked_add(encoded_width)
-                .ok_or(EvaluationErrorCause::AddressOverflow)?;
-            Ok(Value::Address(x86_64::relative_target(
-                address,
-                end_offset,
-                displacement,
-            )?))
-        }
         Step::X86FollowDirectBranch {} => {
             let (bytes, length) = evaluation.read_x86_branch(address)?;
             Ok(Value::Address(x86_64::direct_branch_target(
@@ -1021,19 +979,6 @@ mod tests {
             .unwrap(),
             Value::Address(BASE - 9)
         );
-        assert_eq!(
-            run(
-                &bytes,
-                TargetArchitecture::X86_64,
-                ValueKind::Address,
-                vec![Step::X86ResolveRelative {
-                    displacement_offset: 2,
-                    width: SignedWidth::I32
-                }]
-            )
-            .unwrap(),
-            Value::Address(BASE - 10)
-        );
     }
 
     #[test]
@@ -1215,7 +1160,7 @@ mod tests {
         let source = r#"schema_version = 2
 result = "address"
 steps = [
-    { x86_resolve_relative = { displacement_offset = 2, width = "i32" } },
+    { x86_resolve_pc_relative = { displacement_offset = 2, instruction_length = 7 } },
     { add = { offset = 0 } },
 ]
 "#;
@@ -1228,7 +1173,7 @@ steps = [
                 Limits::default()
             )
             .unwrap(),
-            Value::Address(BASE - 10)
+            Value::Address(BASE - 9)
         );
         for plan in [
             Plan::new(
@@ -1314,9 +1259,9 @@ steps = [
         let value = Plan::new(
             ValueKind::Unsigned,
             vec![
-                Step::X86ResolveRelative {
+                Step::X86ResolvePcRelative {
                     displacement_offset: 0,
-                    width: SignedWidth::I32,
+                    instruction_length: 4,
                 },
                 Step::ReadPointer {
                     offset: 0,
@@ -1354,9 +1299,9 @@ steps = [
                 &(-8_i32).to_le_bytes(),
                 TargetArchitecture::X86_64,
                 ValueKind::Address,
-                vec![Step::X86ResolveRelative {
+                vec![Step::X86ResolvePcRelative {
                     displacement_offset: 0,
-                    width: SignedWidth::I32,
+                    instruction_length: 4,
                 }],
             )
             .unwrap(),
@@ -1475,9 +1420,9 @@ steps = [
 
         let instruction = run_with_limits(
             &[0; 4],
-            vec![Step::X86ResolveRelative {
+            vec![Step::X86ResolvePcRelative {
                 displacement_offset: 0,
-                width: SignedWidth::I32,
+                instruction_length: 4,
             }],
             Limits {
                 max_instruction_bytes: 3,
@@ -1525,13 +1470,14 @@ steps = [
         let json = r#"{
             "schema_version": 2,
             "result": "address",
-            "steps": [{"x86_resolve_relative":{"displacement_offset":1,"width":"i32"}}]
+            "steps": [{"x86_resolve_pc_relative":{"displacement_offset":1,"instruction_length":5}}]
         }"#;
         let plan: Plan = serde_json::from_str(json).unwrap();
         assert_eq!(plan.schema_version(), SCHEMA_VERSION);
         assert_eq!(
-            serde_json::to_value(&plan).unwrap()["steps"][0]["x86_resolve_relative"]["width"],
-            "i32"
+            serde_json::to_value(&plan).unwrap()["steps"][0]["x86_resolve_pc_relative"]
+                ["instruction_length"],
+            5
         );
 
         for invalid in [
@@ -1540,8 +1486,11 @@ steps = [
                 "\"result\": \"address\"",
                 "\"result\": \"address\", \"extra\": true",
             ),
-            json.replace("\"width\":\"i32\"", "\"width\":\"i32\", \"extra\": true"),
-            json.replace("x86_resolve_relative", "unknown_action"),
+            json.replace(
+                "\"instruction_length\":5",
+                "\"instruction_length\":5, \"extra\": true",
+            ),
+            json.replace("x86_resolve_pc_relative", "unknown_action"),
         ] {
             assert!(serde_json::from_str::<Plan>(&invalid).is_err(), "{invalid}");
         }
